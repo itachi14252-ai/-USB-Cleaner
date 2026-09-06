@@ -18,7 +18,9 @@ registro-*.txt
 
 # --- Configuración local con datos propios ---
 # config.json SÍ se versiona (viene vacío, es la plantilla).
-# Si prefieres guardar tus seriales aparte, usa este nombre:
+# preferencias.json NO: lo escribe el programa y lleva los numeros de
+# serie de los discos de quien lo usa.
+preferencias.json
 config.local.json
 
 # --- Windows ---

@@ -1,7 +1,9 @@
 # Limpiador de USB
 
 Interfaz gráfica (WPF sobre PowerShell) para limpiar, formatear y expulsar
-memorias USB, con un guardián que impide tocar unidades protegidas.
+memorias USB, con un guardián que impide tocar unidades protegidas. Tú
+eliges qué discos proteger, y el programa lo recuerda por número de serie;
+lo que nunca se puede desproteger es el sistema.
 
 Estilo HUD: negro y rojo, líneas doradas, esquinas cortadas, corchetes de
 mira, rayas diagonales sobre lo bloqueado y tipografía monoespaciada.
@@ -26,27 +28,69 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "Limpiador-USB.ps1" -Autopru
 
 ## El guardián
 
-Ninguna unidad se toca si dispara **al menos una** de estas reglas:
+Ninguna unidad se toca si dispara **al menos una** regla. Las reglas
+están en tres niveles, y lo que separa un nivel de otro es **quién puede
+quitarlas**.
 
-| Regla | Valor |
+### Nivel 1 — el núcleo. No se puede quitar
+
+Ni desde la ventana, ni desde `config.json`, ni desde `preferencias.json`.
+No hay ninguna ruta en el programa que las levante:
+
+| Regla | Cuándo aplica |
 |---|---|
-| Letras en lista negra | `C:`, `F:`, y la letra del sistema |
-| Números de serie | `NT3FXPHD`, el disco de respaldo que trae el código por defecto |
-| Modelos | seagate, portable, expansion, backup plus, one touch, my passport, my book, elements, canvio, lacie |
-| Etiquetas | `seagate portable drive` |
-| Tamaño | más de 2 TB se asume disco de respaldo |
+| Letra del sistema (normalmente `C:`) | siempre |
 | Disco de sistema o de arranque | siempre |
-| Volumen declarado `Fixed` | solo si además el bus no es USB/SD/MMC |
 | Contiene `Windows`, `Program Files` o `Users` | siempre |
+| Volumen declarado `Fixed` | si además el bus no es USB/SD/MMC |
+| Disco interno | solo diagnóstico, ninguna escritura |
 
-Ese **Seagate Portable Drive** dispara **siete** de estas reglas a la vez.
-Cualquiera de las siete bastaría por sí sola: si algún día cambia de letra,
-si le cambias la etiqueta, o si Windows lo reporta distinto, sigue
-bloqueado por las demás.
+### Nivel 2 — heurísticas de fábrica. Se pueden eximir por disco
 
-Un detalle que importa: ese disco reporta `BusType = USB`, así que un
-filtro ingenuo de "solo unidades USB" **sí lo incluiría**. Por eso el
-blindaje no depende de un solo criterio.
+Sirven para que un disco de respaldo no se borre por descuido. No apuntan
+a ningún disco concreto:
+
+| Regla | Valor por defecto |
+|---|---|
+| Modelos | seagate, portable, expansion, backup plus, one touch, my passport, my book, elements, canvio, lacie |
+| Tamaño | más de 2 TB se asume disco de respaldo |
+| Etiquetas | ninguna (las agregas tú) |
+| Letras extra | ninguna (las agregas tú) |
+
+Un HDD externo típico dispara **dos a la vez** —modelo y tamaño— y
+cualquiera bastaría por sí sola. Un detalle que importa: esos discos
+reportan `BusType = USB`, así que un filtro ingenuo de "solo unidades USB"
+**sí los incluiría**. Por eso el blindaje no depende de un solo criterio.
+
+### Nivel 3 — lo que tú decides, y el programa recuerda
+
+Cada tarjeta trae un botón que cambia según en qué estado esté ese disco:
+
+| Botón | Qué hace |
+|---|---|
+| `PROTEGER` | bloquea toda escritura sobre ese disco, para siempre |
+| `DESPROTEGER` | quita esa protección tuya |
+| `EXIMIR` | libera el disco de las heurísticas del nivel 2 |
+| `REACTIVAR` | le vuelve a aplicar las heurísticas |
+| `PROTEGIDO` (gris) | bloqueado por el nivel 1: no hay nada que quitar |
+
+**Se guarda por número de serie**, en `preferencias.json`. La serie es lo
+único estable: la letra cambia sola, el número de disco cambia al
+reconectar, y la etiqueta la cambia cualquiera. Un disco que no reporte
+serie no se puede recordar, y el botón sale deshabilitado diciéndolo, en
+vez de guardar algo que la próxima vez protegería al aparato equivocado.
+
+### Las reglas de precedencia
+
+Estas tres importan, y las tres están cubiertas por la autoprueba:
+
+1. **Eximir nunca levanta el nivel 1.** Marcar como exento el disco del
+   sistema no hace nada: sigue bloqueado por sus 8 reglas de núcleo. Si el
+   bloqueo viene del núcleo, el botón ni se ofrece habilitado.
+2. **La lista negra de series gana sobre las exenciones.** Una serie que
+   esté en `Seriales` sigue bloqueada aunque también esté en `Permitidos`.
+3. **Proteger gana sobre eximir.** Si una serie acaba en las dos listas,
+   manda la protección.
 
 ### Se verifica tres veces
 
@@ -82,6 +126,11 @@ Si algo cambió entre el paso 1 y el 3, el tercero aborta.
   asignada** (lo normal después de grabar una imagen de Linux): en ese caso
   no puede usar el Shell de Windows y expulsa el dispositivo directamente
   con `IOCTL_STORAGE_EJECT_MEDIA`.
+- **PROTEGER / EXIMIR** — no toca el disco: guarda tu decisión sobre él en
+  `preferencias.json`, por número de serie. Ver [el guardián](#el-guardián).
+  Aparece también en las unidades blindadas, porque es justo ahí donde
+  hace falta para liberarlas — salvo cuando el bloqueo es del nivel 1, y
+  entonces sale en gris.
 
 Qué necesita cada botón:
 
@@ -90,6 +139,7 @@ Qué necesita cada botón:
 | LIMPIAR | volumen que Windows pueda leer |
 | FORMATEAR | al menos una letra asignada |
 | REPARAR, GRABAR, EXPULSAR | nada: trabajan sobre el disco |
+| PROTEGER / EXIMIR | que el disco reporte número de serie |
 
 Después de grabar una imagen de Linux, la memoria se queda sin letra porque
 Windows no sabe montar ISO9660. **No está rota**: `REPARAR` la devuelve a
@@ -409,10 +459,22 @@ tarjeta se ordena siempre primero en la lista.
 
 ---
 
-## config.json
+## Los dos archivos de configuración
 
-Solo puede **agregar** protecciones, nunca quitar las del código. Si lo
-borras o lo dejas inválido, el programa arranca igual de protegido.
+Están separados a propósito: `config.json` lo editas tú a mano y lleva
+comentarios, `preferencias.json` lo escribe el programa. Si el programa
+reescribiera `config.json`, se comería esos comentarios.
+
+| Archivo | Quién lo escribe | Qué lleva |
+|---|---|---|
+| `config.json` | tú, a mano | reglas fijas: letras, series, modelos, etiquetas, límite de tamaño |
+| `preferencias.json` | la ventana | lo que marcaste con `PROTEGER` / `EXIMIR`, por número de serie |
+
+Ninguno de los dos puede quitar el nivel 1. Si los borras o los dejas
+inválidos, el programa arranca igual de protegido — perder una exención
+deja el programa **más** protegido, nunca menos.
+
+### config.json
 
 ```json
 {
@@ -420,7 +482,8 @@ borras o lo dejas inválido, el programa arranca igual de protegido.
   "Seriales":   ["ABC12345"],
   "Nombres":    ["kingston"],
   "Etiquetas":  ["fotos boda"],
-  "Permitidos": ["NA0XYZ12"],
+  "Protegidos": ["NA0XYZ12"],
+  "Permitidos": ["WX21A9B3"],
   "TamMaxGB":   1024
 }
 ```
@@ -429,23 +492,39 @@ borras o lo dejas inválido, el programa arranca igual de protegido.
 
 ### `Permitidos`: discos externos de marca bloqueada
 
-Para trabajar con HDD externos propios de 1 TB hay un problema: la lista de
+Para trabajar con un HDD externo propio hay un problema: la lista de
 modelos bloquea `seagate`, `my passport`, `elements`, `canvio`, `lacie`…
-que son justo las marcas de discos externos.
+que son justo las marcas de discos externos. Y si el disco pasa de 2 TB,
+el límite de tamaño lo bloquea también.
 
-`Permitidos` lleva números de serie concretos que pueden **saltarse las
-reglas de modelo y etiqueta, y nada más**. Nunca puede saltarse:
+`Permitidos` lleva números de serie que quedan **exentos de las
+heurísticas del nivel 2** —modelo, etiqueta, tamaño y las letras que
+agregaste— y de nada más. Nunca puede saltarse:
 
-- la lista negra de series (el Seagate de respaldo sigue bloqueado aunque
-  metas su serie aquí — está probado en la autoprueba),
-- las letras `C:` / `F:`,
-- discos de sistema o de arranque,
-- el límite de tamaño.
+- el nivel 1 completo (sistema, arranque, carpetas de Windows, bus fijo),
+- la lista negra de series: una serie en `Seriales` sigue bloqueada aunque
+  también esté en `Permitidos` — está probado en la autoprueba,
+- una protección que hayas puesto tú con el botón.
+
+Es lo mismo que hace el botón `EXIMIR` de cada tarjeta, pero fijado a mano.
+Lo normal es usar el botón; esto es para cuando quieres que la regla viaje
+con el archivo de configuración.
 
 La serie de un disco se ve en su tarjeta, o con:
 
 ```bash
 powershell -Command "Get-Disk | Select-Object Number,FriendlyName,SerialNumber"
+```
+
+### preferencias.json
+
+No hace falta tocarlo: lo escribe la ventana. Se puede borrar sin miedo.
+
+```json
+{
+  "Protegidos": ["USB-A1B2C3"],
+  "Exentos":    ["WX21A9B3"]
+}
 ```
 
 ---
@@ -608,7 +687,8 @@ día decides empaquetarlo.
 | `Crear acceso directo.cmd` | Crea el acceso directo en el Escritorio. Se ejecuta una vez. |
 | `Crear acceso directo.ps1` | El trabajo real del anterior. Admite `-Destino` y `-Nombre`. |
 | `Limpiador-USB.ps1` | El programa completo. |
-| `config.json` | Protecciones adicionales opcionales. |
+| `config.json` | Protecciones adicionales opcionales, editadas a mano. |
+| `preferencias.json` | Lo que marcaste con PROTEGER / EXIMIR. Lo crea el programa. |
 | `limpiador.ico` | Icono de las ventanas y del acceso directo: negro, marco dorado y las barras `///`. |
 | `Crear icono.ps1` | Regenera `limpiador.ico`. Solo si quieres retocar el diseño. |
 

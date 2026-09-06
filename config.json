@@ -1,5 +1,7 @@
 {
-  "_nota": "Este archivo SOLO PUEDE AGREGAR protecciones. Nunca quita las que estan escritas en el codigo (C:, F:, Seagate, serie NT3FXPHD, discos de sistema). Si lo borras o lo dejas invalido, el programa sigue igual de protegido.",
+  "_nota": "Este archivo SOLO PUEDE AGREGAR protecciones. Nunca quita las del NUCLEO (disco de sistema, disco de arranque, la letra del sistema, unidades con Windows/Program Files/Users, y los volumenes fijos cuyo bus no sea USB/SD/MMC). Si lo borras o lo dejas invalido, el programa sigue igual de protegido.",
+
+  "_donde_se_guarda_lo_de_la_ventana": "Los botones PROTEGER / EXIMIR de cada tarjeta NO escriben aqui: van a preferencias.json, para no pisar estos comentarios. Este archivo es para lo que quieras fijar a mano.",
 
   "Letras": [],
 
@@ -9,7 +11,10 @@
 
   "Etiquetas": [],
 
-  "_Permitidos": "Numeros de serie de discos TUYOS que pueden saltarse las reglas de MODELO y ETIQUETA (por ejemplo un HDD Seagate propio de 1 TB). NO puede saltarse la lista negra de series, ni las letras C:/F:, ni discos de sistema o arranque, ni el limite de tamano. La serie se ve en la tarjeta del disco o con: Get-Disk | Select Number,FriendlyName,SerialNumber",
+  "_Protegidos": "Numeros de serie que quieres bloquear siempre. Es lo mismo que hace el boton PROTEGER, pero fijado a mano.",
+  "Protegidos": [],
+
+  "_Permitidos": "Numeros de serie de discos TUYOS que quedan EXENTOS de las heuristicas: modelo, etiqueta, tamano y las letras que agregaste arriba. Es lo mismo que hace el boton EXIMIR. NO puede saltarse el nucleo, ni la lista negra de series. La serie se ve en la tarjeta del disco o con: Get-Disk | Select Number,FriendlyName,SerialNumber",
   "Permitidos": [],
 
   "_TamMaxGB": "Solo se acepta si es MENOR que el limite base de 2048 GB (2 TB).",

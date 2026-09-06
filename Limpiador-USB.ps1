@@ -5,13 +5,28 @@
     Negro / blanco / rojo con lineas doradas, esquinas cortadas,
     corchetes de mira y rayas diagonales para lo bloqueado.
 
-    SEGURIDAD (no negociable):
-      * C: y F: estan en lista negra permanente.
-      * El disco "Seagate Portable" (serie NT3FXPHD) esta blindado por
-        nombre, por serie, por etiqueta, por tamano y por letra.
-      * Ninguna unidad fija, de sistema o de arranque puede tocarse.
-      * Las mismas reglas se vuelven a evaluar DENTRO del hilo que
-        ejecuta la operacion, justo antes de borrar o formatear.
+    SEGURIDAD, en tres niveles:
+
+      1. NUCLEO INAMOVIBLE. No hay interfaz ni archivo de configuracion
+         que pueda quitarlo:
+           * el disco del sistema y el de arranque,
+           * la letra del sistema (normalmente C:),
+           * cualquier unidad con Windows / Program Files / Users,
+           * los volumenes 'Fixed' cuyo bus no sea USB / SD / MMC,
+           * los discos internos, que solo se listan para diagnosticar.
+
+      2. HEURISTICAS DE FABRICA. Activas por defecto, pensadas para que
+         un disco de respaldo no se borre por accidente: modelos de HDD
+         externo conocidos, etiquetas y el limite de tamano. El usuario
+         puede EXIMIR un disco concreto de estas, nunca del nivel 1.
+
+      3. DECISION DEL USUARIO, recordada entre sesiones. Cada tarjeta
+         tiene un boton para PROTEGER o EXIMIR ese disco. Se guarda por
+         NUMERO DE SERIE en preferencias.json, porque los numeros de
+         disco cambian al reconectar y la serie no.
+
+    Las reglas se vuelven a evaluar DENTRO del hilo que ejecuta la
+    operacion, justo antes de borrar o formatear.
 #>
 
 [CmdletBinding()]
@@ -30,30 +45,45 @@ Set-StrictMode -Version Latest
 #  1. REGLAS DE PROTECCION
 # ==================================================================
 # Estas reglas son ADITIVAS: config.json solo puede AGREGAR
-# protecciones, nunca quitar las de aqui.
+# protecciones, nunca quitar las del NUCLEO.
 $script:Guard = @{
-    Letras    = @('C', 'F')
-    Seriales  = @('NT3FXPHD')
+    # Letras bloqueadas. Las del nucleo se fijan mas abajo y no se pueden
+    # eximir; las que agregue el usuario si.
+    Letras    = @('C')
+    # Vacio a proposito: aqui no va ninguna serie concreta de fabrica. Se
+    # llena desde config.json o desde el boton PROTEGER de cada tarjeta.
+    Seriales  = @()
+    # Heuristica generica: son las marcas tipicas de disco externo de
+    # respaldo. No apunta a ningun disco en particular, y un disco propio
+    # se exime con el boton de su tarjeta.
     Nombres   = @(
         'seagate', 'portable', 'expansion', 'backup plus', 'one touch',
         'my passport', 'my book', 'elements', 'canvio', 'lacie'
     )
-    Etiquetas = @('seagate portable drive')
-    # 2 TB: hay que poder formatear discos HDD de 1 TB. El Seagate de
-    # respaldo (4 TB) sigue por encima del limite, y ademas lo bloquean
-    # su serie, su modelo, su etiqueta y su letra por separado.
+    Etiquetas = @()
+    # 2 TB: hay que poder formatear discos HDD de 1 TB sin exenciones. Por
+    # encima se asume disco de respaldo. Es una heuristica, asi que un
+    # disco exento se la salta.
     TamMaxGB  = 2048
-    # Series concretas que pueden saltarse las reglas de MODELO y ETIQUETA
-    # (para HDD propios de marca bloqueada). Nunca se salta la lista negra
-    # de series, ni las letras, ni sistema/arranque, ni el tamano.
+    # Series EXENTAS de las heuristicas (modelo, etiqueta, tamano y las
+    # letras que agrego el usuario). Nunca se salta el nucleo, ni la lista
+    # negra de series.
     Permitidos = @()
+    # Series que el usuario decidio proteger a mano. Solo suman.
+    Protegidos = @()
 }
 
-# Letra del sistema, siempre protegida aunque no sea C:
+# ------------------------------------------------------------------
+#  NUCLEO INAMOVIBLE
+# ------------------------------------------------------------------
+# La letra del sistema va siempre, aunque no sea C:. Estas letras se
+# guardan aparte porque son las unicas que una exencion NO puede saltar:
+# el resto de Guard.Letras las agrega el usuario y si son eximibles.
 $sysLetter = ($env:SystemDrive -replace '[:\\]', '').ToUpper()
 if ($sysLetter -and $script:Guard.Letras -notcontains $sysLetter) {
     $script:Guard.Letras += $sysLetter
 }
+$script:LetrasNucleo = @($script:Guard.Letras)
 
 # Extensiones opcionales del usuario (solo suman)
 # Carpeta del programa. $PSScriptRoot no existe si el script se empaqueta
@@ -75,7 +105,7 @@ $cfgPath = Join-Path $script:CarpetaBase 'config.json'
 if (Test-Path -LiteralPath $cfgPath) {
     try {
         $cfg = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        foreach ($k in 'Letras', 'Seriales', 'Nombres', 'Etiquetas', 'Permitidos') {
+        foreach ($k in 'Letras', 'Seriales', 'Nombres', 'Etiquetas', 'Permitidos', 'Protegidos') {
             if ($cfg.PSObject.Properties.Name -contains $k -and $cfg.$k) {
                 $script:Guard[$k] = @($script:Guard[$k]) + @($cfg.$k) | Select-Object -Unique
             }
@@ -89,6 +119,72 @@ if (Test-Path -LiteralPath $cfgPath) {
         # config invalido: se ignora, las reglas base siguen intactas
     }
 }
+
+# ------------------------------------------------------------------
+#  PREFERENCIAS DEL USUARIO (las que escribe la propia ventana)
+# ------------------------------------------------------------------
+# Van en un archivo aparte de config.json a proposito: config.json lo
+# edita el usuario a mano y lleva comentarios, y reescribirlo desde el
+# programa se los comeria. Aqui solo hay dos listas de numeros de serie.
+#
+# La serie es la clave porque es lo unico estable: la letra cambia sola,
+# el numero de disco cambia al reconectar, la etiqueta la cambia
+# cualquiera. Un disco sin serie legible no se puede recordar, y el
+# boton lo dice en vez de guardar algo que no serviria.
+$script:PrefPath = Join-Path $script:CarpetaBase 'preferencias.json'
+$script:Pref = @{ Protegidos = @(); Exentos = @() }
+
+function Import-Preferencias {
+    $script:Pref = @{ Protegidos = @(); Exentos = @() }
+    if (-not (Test-Path -LiteralPath $script:PrefPath)) { return }
+    try {
+        $p = Get-Content -LiteralPath $script:PrefPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($k in 'Protegidos', 'Exentos') {
+            if ($p.PSObject.Properties.Name -contains $k -and $p.$k) {
+                $script:Pref[$k] = @($p.$k | ForEach-Object { "$_".Trim() } |
+                                     Where-Object { $_ } | Select-Object -Unique)
+            }
+        }
+    } catch {
+        # preferencias corruptas: se ignoran. Perder una exencion deja el
+        # programa MAS protegido, nunca menos, asi que fallar aqui es seguro.
+    }
+}
+
+function Save-Preferencias {
+    try {
+        ([pscustomobject]@{
+            _nota      = 'Lo escribe la ventana con los botones PROTEGER / EXIMIR. Se puede borrar sin miedo: el programa arranca igual de protegido.'
+            Protegidos = @($script:Pref.Protegidos)
+            Exentos    = @($script:Pref.Exentos)
+        } | ConvertTo-Json -Depth 3) |
+            Set-Content -LiteralPath $script:PrefPath -Encoding UTF8 -ErrorAction Stop
+        $true
+    } catch {
+        $false
+    }
+}
+
+# Las preferencias se vuelcan a Guard, que es lo que leen las reglas.
+# Se rehace entero en cada cambio para que quitar una preferencia la
+# quite de verdad, sin residuos de la carga anterior.
+$script:GuardBase = @{
+    Seriales   = @($script:Guard.Seriales)
+    Permitidos = @($script:Guard.Permitidos)
+}
+function Sync-Preferencias {
+    $script:Guard.Protegidos = @($script:Pref.Protegidos)
+    $script:Guard.Seriales   = @(@($script:GuardBase.Seriales) + @($script:Pref.Protegidos) |
+                                 Where-Object { $_ } | Select-Object -Unique)
+    # Una serie protegida a mano gana sobre una exencion: si esta en las
+    # dos listas, manda la proteccion.
+    $script:Guard.Permitidos = @(@($script:GuardBase.Permitidos) + @($script:Pref.Exentos) |
+                                 Where-Object { $_ -and $_ -notin $script:Pref.Protegidos } |
+                                 Select-Object -Unique)
+}
+
+Import-Preferencias
+Sync-Preferencias
 
 # ==================================================================
 #  2. ENSAMBLADOS
@@ -981,27 +1077,75 @@ function Test-SeriePermitida {
 }
 
 function Get-RazonesBloqueo {
-    param([hashtable]$D)
+    # -SoloNucleo devuelve unicamente las razones que NINGUNA exencion
+    # puede levantar. Si vuelve vacio, este disco se puede eximir; si trae
+    # algo, el boton de eximir ni se ofrece.
+    param([hashtable]$D, [switch]$SoloNucleo)
 
     $r = @()
     $letra = if ($D.Letra) { ([string]$D.Letra).ToUpper() } else { '' }
+    $bus   = if ($D.ContainsKey('Bus')) { [string]$D.Bus } else { '' }
 
-    if ($letra -and $script:Guard.Letras -contains $letra) {
-        $r += "LETRA $letra`: EN LISTA NEGRA PERMANENTE"
+    # ============ NUCLEO INAMOVIBLE ============
+    # Nada de lo de este bloque se puede eximir desde la interfaz ni
+    # desde ningun archivo de configuracion.
+    if ($letra -and $script:LetrasNucleo -contains $letra) {
+        $r += "LETRA $letra`: DEL SISTEMA - LISTA NEGRA PERMANENTE"
     }
     if ($D.EsSistema)  { $r += 'DISCO DEL SISTEMA OPERATIVO' }
     if ($D.EsArranque) { $r += 'DISCO DE ARRANQUE' }
 
-    # La lista negra de series se comprueba SIEMPRE y gana sobre todo lo demas.
-    if ($D.Serie) {
-        $s = ([string]$D.Serie).Trim()
-        foreach ($bs in $script:Guard.Seriales) {
-            if ($s -and $s -like "*$bs*") { $r += "NUMERO DE SERIE BLINDADO ($bs)" }
+    # Los discos internos se listan solo para diagnosticar (que es de
+    # lectura). Ninguna accion de escritura puede alcanzarlos.
+    if ($D.ContainsKey('SoloDiagnostico') -and $D.SoloDiagnostico) {
+        $r += "BUS $bus - SOLO DIAGNOSTICO, NINGUNA ESCRITURA PERMITIDA"
+    }
+    # Los HDD externos por USB se declaran 'Fixed' igual que un disco interno.
+    # Solo se bloquea por eso si ademas el bus no es de medio extraible: el
+    # escaneo ya filtra por USB/SD/MMC, y sistema/arranque van por su cuenta.
+    # Si no se sabe el bus, se asume lo peor y se bloquea.
+    if ($D.TipoVol -eq 'Fixed' -and $bus -notin 'USB', 'SD', 'MMC') {
+        $r += "VOLUMEN FIJO EN BUS $(if ($bus) { $bus } else { 'DESCONOCIDO' }) - NO ES UN MEDIO EXTRAIBLE"
+    }
+    if ($letra) {
+        foreach ($p in 'Windows', 'Program Files', 'Users') {
+            if (Test-Path -LiteralPath "$letra`:\$p" -ErrorAction SilentlyContinue) {
+                $r += "CONTIENE CARPETA DE SISTEMA ($($p.ToUpper()))"
+            }
         }
     }
 
-    # Solo despues, una serie permitida puede saltarse modelo y etiqueta.
+    if ($SoloNucleo) { return $r | Select-Object -Unique }
+
+    # ============ DECISION DEL USUARIO ============
+    # Lo que el usuario marco a mano. Gana sobre cualquier exencion.
+    $serie = if ($D.Serie) { ([string]$D.Serie).Trim() } else { '' }
+    if ($serie) {
+        foreach ($pr in $script:Guard.Protegidos) {
+            if ($pr -and $serie -like "*$pr*") {
+                $r += "PROTEGIDO POR TI - SERIE $pr (se quita desde su tarjeta)"
+            }
+        }
+    }
+
+    # ============ LISTA NEGRA DE SERIES ============
+    # Se comprueba SIEMPRE y gana sobre las exenciones.
+    if ($serie) {
+        foreach ($bs in $script:Guard.Seriales) {
+            # Las que ya se reportaron como decision del usuario no se repiten.
+            if ($serie -like "*$bs*" -and $bs -notin $script:Guard.Protegidos) {
+                $r += "NUMERO DE SERIE BLINDADO ($bs)"
+            }
+        }
+    }
+
+    # ============ HEURISTICAS, EXIMIBLES ============
+    # Un disco exento se salta este bloque entero, y solo este.
     if (-not (Test-SeriePermitida $D.Serie)) {
+        if ($letra -and $script:Guard.Letras -contains $letra -and
+            $script:LetrasNucleo -notcontains $letra) {
+            $r += "LETRA $letra`: EN LA LISTA NEGRA DE TU CONFIGURACION"
+        }
         if ($D.Modelo) {
             $m = ([string]$D.Modelo).ToLower()
             foreach ($bn in $script:Guard.Nombres) {
@@ -1014,31 +1158,9 @@ function Get-RazonesBloqueo {
                 if ($e -like "*$be*") { $r += "ETIQUETA BLINDADA '$($D.Etiqueta)'" }
             }
         }
-    }
-    if ($D.TamDisco -gt ($script:Guard.TamMaxGB * 1GB)) {
-        $r += ("EXCEDE EL LIMITE DE {0} GB ({1}) - SE ASUME DISCO DE RESPALDO" -f `
-               $script:Guard.TamMaxGB, (Format-Tam $D.TamDisco))
-    }
-    # Los HDD externos por USB se declaran 'Fixed' igual que un disco interno.
-    # Solo se bloquea por eso si ademas el bus no es de medio extraible: el
-    # escaneo ya filtra por USB/SD/MMC, y sistema/arranque van por su cuenta.
-    # Si no se sabe el bus, se asume lo peor y se bloquea.
-    $bus = if ($D.ContainsKey('Bus')) { [string]$D.Bus } else { '' }
-
-    # Los discos internos se listan solo para diagnosticar (que es de
-    # lectura). Ninguna accion de escritura puede alcanzarlos.
-    if ($D.ContainsKey('SoloDiagnostico') -and $D.SoloDiagnostico) {
-        $r += "BUS $bus - SOLO DIAGNOSTICO, NINGUNA ESCRITURA PERMITIDA"
-    }
-    if ($D.TipoVol -eq 'Fixed' -and $bus -notin 'USB', 'SD', 'MMC') {
-        $r += "VOLUMEN FIJO EN BUS $(if ($bus) { $bus } else { 'DESCONOCIDO' }) - NO ES UN MEDIO EXTRAIBLE"
-    }
-
-    if ($letra) {
-        foreach ($p in 'Windows', 'Program Files', 'Users') {
-            if (Test-Path -LiteralPath "$letra`:\$p" -ErrorAction SilentlyContinue) {
-                $r += "CONTIENE CARPETA DE SISTEMA ($($p.ToUpper()))"
-            }
+        if ($D.TamDisco -gt ($script:Guard.TamMaxGB * 1GB)) {
+            $r += ("EXCEDE EL LIMITE DE {0} GB ({1}) - SE ASUME DISCO DE RESPALDO" -f `
+                   $script:Guard.TamMaxGB, (Format-Tam $D.TamDisco))
         }
     }
     $r | Select-Object -Unique
@@ -1074,26 +1196,44 @@ function Get-RazonesBloqueoDisco {
     if ($ModeloEsperado -and "$($d.FriendlyName)".Trim() -ne "$ModeloEsperado".Trim()) {
         $r += "EL DISCO $Disco CAMBIO DE MODELO - SE ESPERABA '$ModeloEsperado', HAY '$($d.FriendlyName)'"
     }
+    # --- nucleo inamovible: ninguna exencion lo levanta ---
     if ($d.IsSystem)  { $r += 'DISCO DEL SISTEMA OPERATIVO' }
     if ($d.IsBoot)    { $r += 'DISCO DE ARRANQUE' }
     if ($d.BusType -notin 'USB', 'SD', 'MMC') { $r += "BUS $($d.BusType) - NO ES UN MEDIO EXTRAIBLE" }
-    if ($d.Size -gt ($script:Guard.TamMaxGB * 1GB)) {
-        $r += ("EXCEDE EL LIMITE DE {0} GB ({1})" -f $script:Guard.TamMaxGB, (Format-Tam $d.Size))
+
+    # --- decision del usuario y lista negra de series ---
+    foreach ($pr in $script:Guard.Protegidos) {
+        if ($pr -and $serieReal -like "*$pr*") {
+            $r += "PROTEGIDO POR TI - SERIE $pr (se quita desde su tarjeta)"
+        }
     }
     foreach ($bs in $script:Guard.Seriales) {
-        if ($serieReal -like "*$bs*") { $r += "NUMERO DE SERIE BLINDADO ($bs)" }
+        if ($serieReal -like "*$bs*" -and $bs -notin $script:Guard.Protegidos) {
+            $r += "NUMERO DE SERIE BLINDADO ($bs)"
+        }
     }
+
+    # --- heuristicas: solo estas se pueden eximir ---
     if (-not (Test-SeriePermitida $serieReal)) {
+        if ($d.Size -gt ($script:Guard.TamMaxGB * 1GB)) {
+            $r += ("EXCEDE EL LIMITE DE {0} GB ({1})" -f $script:Guard.TamMaxGB, (Format-Tam $d.Size))
+        }
         foreach ($bn in $script:Guard.Nombres) {
             if ("$($d.FriendlyName)".ToLower() -like "*$bn*") { $r += "MODELO CONTIENE '$($bn.ToUpper())'" }
         }
     }
 
     # Ningun volumen del disco puede estar blindado: se van todos juntos.
+    # Las letras del nucleo bloquean siempre; las que agrego el usuario a
+    # su configuracion siguen la misma exencion que el resto de heuristicas.
     foreach ($p in @(Get-Partition -DiskNumber $Disco -ErrorAction SilentlyContinue |
                      Where-Object { $_.DriveLetter })) {
         $L = ([string]$p.DriveLetter).ToUpper()
-        if ($script:Guard.Letras -contains $L) { $r += "EL DISCO CONTIENE LA UNIDAD BLINDADA $L`:" }
+        if ($script:LetrasNucleo -contains $L) {
+            $r += "EL DISCO CONTIENE LA UNIDAD DEL SISTEMA $L`:"
+        } elseif ($script:Guard.Letras -contains $L -and -not (Test-SeriePermitida $serieReal)) {
+            $r += "EL DISCO CONTIENE LA UNIDAD BLINDADA $L`:"
+        }
         foreach ($sys in 'Windows', 'Program Files', 'Users') {
             if (Test-Path -LiteralPath "$L`:\$sys" -ErrorAction SilentlyContinue) {
                 $r += "EL DISCO CONTIENE CARPETA DE SISTEMA EN $L`: ($($sys.ToUpper()))"
@@ -1276,6 +1416,130 @@ function New-BotonRecuperar {
     $b.Tag     = @{ Datos = $D; Op = 'recuperar' }
     $b.Add_Click({ param($s, $e) Invoke-Operacion $s.Tag.Datos $s.Tag.Op })
     if ($D.SinMedio) { $b.IsEnabled = $false }
+    $b
+}
+
+# ------------------------------------------------------------------
+#  BOTON DE PROTECCION  (PROTEGER / EXIMIR, recordado entre sesiones)
+# ------------------------------------------------------------------
+# En que estado esta este disco respecto a la decision del usuario.
+function Get-EstadoProteccion {
+    param([hashtable]$D)
+    $serie  = if ($D.Serie) { ([string]$D.Serie).Trim() } else { '' }
+    $nucleo = @(Get-RazonesBloqueo $D -SoloNucleo)
+    @{
+        Serie     = $serie
+        Nucleo    = $nucleo
+        # Con una sola razon de nucleo, la exencion no se ofrece siquiera.
+        EsNucleo  = ($nucleo.Count -gt 0)
+        Protegido = ($serie -and $script:Pref.Protegidos -contains $serie)
+        Exento    = ($serie -and $script:Pref.Exentos    -contains $serie)
+    }
+}
+
+# Aplica un cambio de preferencia y refresca la lista. Devuelve $false si
+# no se pudo guardar, para no dejar creer que quedo recordado.
+function Set-Proteccion {
+    param([string]$Serie, [ValidateSet('proteger', 'desproteger', 'eximir', 'quitar-exencion')][string]$Accion)
+
+    if (-not $Serie) { return $false }
+    switch ($Accion) {
+        'proteger' {
+            $script:Pref.Protegidos = @(@($script:Pref.Protegidos) + $Serie | Select-Object -Unique)
+            $script:Pref.Exentos    = @($script:Pref.Exentos | Where-Object { $_ -ne $Serie })
+        }
+        'desproteger' {
+            $script:Pref.Protegidos = @($script:Pref.Protegidos | Where-Object { $_ -ne $Serie })
+        }
+        'eximir' {
+            $script:Pref.Exentos    = @(@($script:Pref.Exentos) + $Serie | Select-Object -Unique)
+            $script:Pref.Protegidos = @($script:Pref.Protegidos | Where-Object { $_ -ne $Serie })
+        }
+        'quitar-exencion' {
+            $script:Pref.Exentos    = @($script:Pref.Exentos | Where-Object { $_ -ne $Serie })
+        }
+    }
+    Sync-Preferencias
+    $guardado = Save-Preferencias
+    # Guardar es lo que importa; redibujar es cosmetico. En la autoprueba
+    # no hay lista que refrescar, y un fallo aqui no debe tumbar el cambio.
+    try { Update-Lista } catch { }
+    $guardado
+}
+
+function New-BotonProteccion {
+    param([hashtable]$D)
+
+    $st = Get-EstadoProteccion $D
+    $b  = New-Object Windows.Controls.Button
+    $b.Width  = 116
+    $b.Margin = New-Object Windows.Thickness 0, 6, 6, 0
+    $b.Style  = $win.FindResource('Btn')
+
+    # Sin serie no hay nada estable que recordar: la letra y el numero de
+    # disco cambian solos, y guardar por ellos protegeria al aparato
+    # equivocado la proxima vez.
+    if (-not $st.Serie) {
+        $b.Content   = 'PROTEGER'
+        $b.IsEnabled = $false
+        $b.ToolTip   = 'Este disco no reporta numero de serie, y la preferencia se guarda por serie. La letra y el numero de disco cambian al reconectar, asi que recordarlo por ahi acabaria protegiendo otro aparato.'
+        return $b
+    }
+
+    if ($st.Protegido) {
+        $b.Content = 'DESPROTEGER'
+        $b.Style   = $win.FindResource('BtnRojo')
+        $b.ToolTip = "Quita la proteccion que pusiste sobre este disco (serie $($st.Serie)). Las protecciones del sistema no se ven afectadas."
+        $b.Tag     = @{ Serie = $st.Serie; Accion = 'desproteger' }
+    }
+    elseif ($st.EsNucleo) {
+        # Sistema, arranque, carpetas de Windows o bus no extraible.
+        $b.Content   = 'PROTEGIDO'
+        $b.IsEnabled = $false
+        $b.ToolTip   = "Proteccion no removible. Motivo: $($st.Nucleo -join ' / '). Esto no se puede desactivar desde la interfaz ni desde ningun archivo de configuracion."
+        return $b
+    }
+    elseif ($st.Exento) {
+        $b.Content = 'REACTIVAR'
+        $b.ToolTip = "Vuelve a aplicar las reglas normales a este disco (serie $($st.Serie)), que ahora esta exento de ellas."
+        $b.Tag     = @{ Serie = $st.Serie; Accion = 'quitar-exencion' }
+    }
+    elseif ($D.Protegida) {
+        # Bloqueado solo por heuristicas: modelo, etiqueta o tamano.
+        $b.Content = 'EXIMIR'
+        $b.Style   = $win.FindResource('BtnRojo')
+        $b.ToolTip = 'Marca este disco como tuyo y conocido, para poder operar sobre el. Se salta las reglas de modelo, etiqueta y tamano, nunca las del sistema.'
+        $b.Tag     = @{ Serie = $st.Serie; Accion = 'eximir' }
+    }
+    else {
+        $b.Content = 'PROTEGER'
+        $b.ToolTip = 'Bloquea toda escritura sobre este disco y lo recuerda para las proximas veces, por su numero de serie.'
+        $b.Tag     = @{ Serie = $st.Serie; Accion = 'proteger' }
+    }
+
+    $b.Add_Click({
+        param($s, $e)
+        $serie  = $s.Tag.Serie
+        $accion = $s.Tag.Accion
+
+        # Solo se confirma lo que BAJA las defensas. Proteger no pregunta:
+        # equivocarse hacia el lado seguro no cuesta nada.
+        if ($accion -in 'desproteger', 'eximir') {
+            $cuerpo = if ($accion -eq 'eximir') {
+                "El disco de serie $serie dejara de estar bloqueado por las reglas de modelo, etiqueta y tamano, y podras borrarlo y formatearlo.`n`nLas protecciones del sistema (disco de arranque, carpetas de Windows, bus no extraible) siguen aplicando y no se pueden quitar.`n`nSe recordara hasta que pulses REACTIVAR."
+            } else {
+                "El disco de serie $serie dejara de estar protegido y volvera a las reglas normales.`n`nSi las reglas de fabrica no lo bloquean por su cuenta, quedara operable."
+            }
+            $ok = Show-Aviso -Titulo 'Confirmar cambio de proteccion' -Nivel 'warn' -SiNo -Cuerpo $cuerpo
+            if (-not $ok) { return }
+        }
+
+        if (Set-Proteccion $serie $accion) {
+            Write-Log "PREFERENCIA GUARDADA: $accion  $SEP  serie $serie" 'ok'
+        } else {
+            Write-Log "NO SE PUDO ESCRIBIR preferencias.json - el cambio vale solo para esta sesion" 'warn'
+        }
+    })
     $b
 }
 
@@ -1477,6 +1741,9 @@ function New-Tarjeta {
         # perder algo.
         $acc.Children.Add((New-BotonDiagnostico $D)) | Out-Null
         $acc.Children.Add((New-BotonRecuperar $D)) | Out-Null
+        # No escribe en el disco: cambia una preferencia. Si el bloqueo es
+        # del nucleo, el propio boton se dibuja deshabilitado.
+        $acc.Children.Add((New-BotonProteccion $D)) | Out-Null
     }
     elseif ($D.SinMedio) {
         $t = New-Object Windows.Controls.TextBlock
@@ -1532,6 +1799,7 @@ function New-Tarjeta {
         }
         $rejilla.Children.Add((New-BotonDiagnostico $D)) | Out-Null
         $rejilla.Children.Add((New-BotonRecuperar $D)) | Out-Null
+        $rejilla.Children.Add((New-BotonProteccion $D)) | Out-Null
     }
 
     Add-Muescas  $root ($(if ($protegida) { $C.Rojo } else { $C.OroTenue })) 12
@@ -3684,25 +3952,35 @@ function Update-Lista {
 
 function Show-Protegidas {
     Show-Aviso -Titulo 'Reglas de blindaje activas' -Nivel 'warn' -Secciones @(
-        @{ Titulo = 'LETRAS SIEMPRE BLOQUEADAS'
-           Lineas = @($script:Guard.Letras | ForEach-Object { "$_`:" }) },
-        @{ Titulo = 'NUMEROS DE SERIE BLOQUEADOS'
-           Lineas = @($script:Guard.Seriales) },
-        @{ Titulo = 'MODELOS BLOQUEADOS (COINCIDENCIA PARCIAL)'
-           Lineas = @($script:Guard.Nombres) },
-        @{ Titulo = 'ETIQUETAS BLOQUEADAS'
-           Lineas = @($script:Guard.Etiquetas) },
-        @{ Titulo = 'LIMITE DE TAMANO'
-           Lineas = @("mas de $($script:Guard.TamMaxGB) GB se asume disco de respaldo") },
-        @{ Titulo = 'SERIES PERMITIDAS (SALTAN MODELO Y ETIQUETA, NADA MAS)'
-           Lineas = @(if ($script:Guard.Permitidos.Count) { $script:Guard.Permitidos }
-                      else { 'ninguna configurada' }) },
-        @{ Titulo = 'BLOQUEADO SIEMPRE, SIN EXCEPCION'
+        @{ Titulo = 'NIVEL 1 - NUCLEO, NO SE PUEDE QUITAR NI DESDE AQUI NI DESDE UN ARCHIVO'
            Lineas = @(
+               "la letra del sistema: $(($script:LetrasNucleo | ForEach-Object { "$_`:" }) -join ', ')",
                'discos de sistema o de arranque',
                'volumenes Fijos cuyo bus no sea USB / SD / MMC',
                'unidades con carpetas Windows / Program Files / Users',
-               'la lista negra de series gana sobre las series permitidas') },
+               'discos internos: solo diagnostico, ninguna escritura') },
+        @{ Titulo = 'NIVEL 2 - HEURISTICAS DE FABRICA (un disco exento se las salta)'
+           Lineas = @(
+               "modelos: $($script:Guard.Nombres -join ', ')",
+               $(if ($script:Guard.Etiquetas.Count) { "etiquetas: $($script:Guard.Etiquetas -join ', ')" }
+                 else { 'etiquetas: ninguna configurada' }),
+               "tamano: mas de $($script:Guard.TamMaxGB) GB se asume disco de respaldo",
+               $(if (@($script:Guard.Letras | Where-Object { $_ -notin $script:LetrasNucleo }).Count) {
+                     "letras que agregaste: $((@($script:Guard.Letras | Where-Object { $_ -notin $script:LetrasNucleo }) | ForEach-Object { "$_`:" }) -join ', ')"
+                 } else { 'letras extra: ninguna' })) },
+        @{ Titulo = 'NIVEL 3 - LO QUE TU DECIDISTE (recordado en preferencias.json)'
+           Lineas = @(
+               $(if ($script:Pref.Protegidos.Count) { "PROTEGIDOS a mano: $($script:Pref.Protegidos -join ', ')" }
+                 else { 'protegidos a mano: ninguno' }),
+               $(if ($script:Pref.Exentos.Count) { "EXENTOS de las heuristicas: $($script:Pref.Exentos -join ', ')" }
+                 else { 'exentos: ninguno' }),
+               'se cambia con el boton PROTEGER / EXIMIR de cada tarjeta') },
+        @{ Titulo = 'NUMEROS DE SERIE BLOQUEADOS (nivel 2 + 3, gana sobre las exenciones)'
+           Lineas = @(if ($script:Guard.Seriales.Count) { $script:Guard.Seriales }
+                      else { 'ninguno configurado' }) },
+        @{ Titulo = 'SERIES EXENTAS (SALTAN MODELO, ETIQUETA, TAMANO Y LETRAS EXTRA)'
+           Lineas = @(if ($script:Guard.Permitidos.Count) { $script:Guard.Permitidos }
+                      else { 'ninguna configurada' }) },
         @{ Titulo = 'CUANDO SE COMPRUEBA'
            Lineas = @(
                'al dibujar la tarjeta, para decidir si muestra botones',
@@ -3869,7 +4147,7 @@ if ($Autoprueba) {
     Write-Host ''
     foreach ($caso in @(
         @{ Letra='C'; Modelo='Micron_2450'; Etiqueta=''; Serie='x'; TamDisco=1TB; TipoVol='Fixed'; Bus='NVMe'; EsSistema=$true;  EsArranque=$true },
-        @{ Letra='F'; Modelo='Seagate Portable'; Etiqueta='Seagate Portable Drive'; Serie='NT3FXPHD'; TamDisco=4TB; TipoVol='Fixed'; Bus='USB'; EsSistema=$false; EsArranque=$false }
+        @{ Letra='E'; Modelo='WD My Passport 25E2'; Etiqueta='RESPALDO'; Serie='WX21A9FICTICIA'; TamDisco=4TB; TipoVol='Fixed'; Bus='USB'; EsSistema=$false; EsArranque=$false }
     )) {
         $n = @(Get-RazonesBloqueo $caso).Count
         $r = if ($n -gt 0) { "OK  ($n reglas)" } else { 'FALLO CRITICO' }
@@ -3904,20 +4182,21 @@ if ($Autoprueba) {
     }
     $estado = @{}
     foreach ($b in $botones) { $estado["$($b.Content)"] = [bool]$b.IsEnabled }
-    $ok = ($estado.Count -eq 7) -and (-not $estado['LIMPIAR']) -and (-not $estado['FORMATEAR']) -and
+    # 8 botones: los 5 de accion, diagnostico, recuperar y el de proteccion.
+    $ok = ($estado.Count -eq 8) -and (-not $estado['LIMPIAR']) -and (-not $estado['FORMATEAR']) -and
           $estado['REPARAR'] -and $estado['GRABAR'] -and $estado['EXPULSAR'] -and
-          $estado['DIAGNOSTICO'] -and $estado['RECUPERAR']
-    Write-Host ("  LIMPIAR={0} FORMATEAR={1} REPARAR={2} GRABAR={3} EXPULSAR={4} DIAG={5} RECUP={6}  -> {7}" -f `
+          $estado['DIAGNOSTICO'] -and $estado['RECUPERAR'] -and $estado['PROTEGER']
+    Write-Host ("  LIMPIAR={0} FORMATEAR={1} REPARAR={2} GRABAR={3} EXPULSAR={4} DIAG={5} RECUP={6} PROT={7}  -> {8}" -f `
         $estado['LIMPIAR'], $estado['FORMATEAR'], $estado['REPARAR'], $estado['GRABAR'],
-        $estado['EXPULSAR'], $estado['DIAGNOSTICO'], $estado['RECUPERAR'],
+        $estado['EXPULSAR'], $estado['DIAGNOSTICO'], $estado['RECUPERAR'], $estado['PROTEGER'],
         $(if ($ok) { 'OK' } else { 'FALLO' })) `
         -ForegroundColor $(if ($ok) { 'Green' } else { 'Red' })
 
     # --- una unidad BLINDADA debe ofrecer diagnostico y NADA de escritura ---
     Write-Host ''
     Write-Host '  --- diagnostico en unidad blindada (solo lectura) ---' -ForegroundColor Yellow
-    $blindada = @{ Letra='F'; Modelo='Seagate Portable'; Etiqueta='Seagate Portable Drive'
-                   Serie='NT3FXPHD'; TamDisco=4TB; TamVol=4TB; Libre=1TB; Fs='NTFS'
+    $blindada = @{ Letra='E'; Modelo='WD My Passport 25E2'; Etiqueta='RESPALDO'
+                   Serie='WX21A9FICTICIA'; TamDisco=4TB; TamVol=4TB; Libre=1TB; Fs='NTFS'
                    TipoVol='Fixed'; Bus='USB'; Disco=9; Sector=512
                    EsSistema=$false; EsArranque=$false; SinMedio=$false; Montado=$true
                    SoloDiagnostico=$false; Protegida=$false; Razones=@() }
@@ -3932,11 +4211,12 @@ if ($Autoprueba) {
         elseif ($el -is [Windows.Controls.Border] -and $el.Child) { $pila2.Push($el.Child) }
     }
     $nombres = @($bt2 | ForEach-Object { "$($_.Content)" })
-    # Solo se admiten los dos que leen el origen sin escribirlo. Cualquier
-    # boton de escritura aqui seria un fallo grave.
-    $permitidos = @('DIAGNOSTICO', 'RECUPERAR')
+    # Solo se admiten los que leen el origen sin escribirlo, mas el boton
+    # de proteccion, que no toca el disco: escribe preferencias.json.
+    # Cualquier boton de escritura sobre el disco aqui seria un fallo grave.
+    $permitidos = @('DIAGNOSTICO', 'RECUPERAR', 'PROTEGER', 'DESPROTEGER', 'EXIMIR', 'REACTIVAR', 'PROTEGIDO')
     $intrusos = @($nombres | Where-Object { $_ -notin $permitidos })
-    $soloLectura = ($intrusos.Count -eq 0 -and $nombres.Count -eq 2)
+    $soloLectura = ($intrusos.Count -eq 0 -and $nombres.Count -eq 3)
     Write-Host ("  botones ofrecidos: {0}  -> {1}" -f `
         $(if ($nombres) { $nombres -join ', ' } else { 'ninguno' }),
         $(if ($soloLectura) { 'OK, solo operaciones de lectura' } else { "FALLO CRITICO: $($intrusos -join ', ')" })) `
@@ -3953,47 +4233,139 @@ if ($Autoprueba) {
         $(if ($ri.Count -gt 0) { 'OK' } else { 'FALLO CRITICO' }), $ri.Count, $tieneSoloDiag) `
         -ForegroundColor $(if ($ri.Count -gt 0 -and $tieneSoloDiag) { 'Green' } else { 'Red' })
 
-    # --- la lista de permitidos NO puede desbloquear lo blindado ---
-    # Se mete a proposito la serie del Seagate en la lista de permitidos:
-    # la lista negra tiene que ganar igual.
+    # --- la lista de exentos NO puede desbloquear lo blindado ---
+    # Se mete a proposito una serie de la lista negra en los exentos: la
+    # lista negra tiene que ganar igual.
     Write-Host ''
-    Write-Host '  --- lista de series permitidas ---' -ForegroundColor Yellow
-    $guardOriginal = $script:Guard.Permitidos
+    Write-Host '  --- series exentas de las heuristicas ---' -ForegroundColor Yellow
+    $permOriginal  = $script:Guard.Permitidos
+    $serieOriginal = $script:Guard.Seriales
     try {
-        $script:Guard.Permitidos = @('NT3FXPHD', 'SERIE-HDD-PROPIO')
+        $script:Guard.Seriales   = @('SERIE-EN-LISTA-NEGRA')
+        $script:Guard.Permitidos = @('SERIE-EN-LISTA-NEGRA', 'SERIE-HDD-PROPIO')
 
-        $seagate = @{ Letra='F'; Modelo='Seagate Portable'; Etiqueta='Seagate Portable Drive'
-                      Serie='NT3FXPHD'; TamDisco=4TB; TipoVol='Fixed'; Bus='USB'
-                      EsSistema=$false; EsArranque=$false }
-        $n1 = @(Get-RazonesBloqueo $seagate).Count
-        Write-Host ("  Seagate con su serie en PERMITIDOS: {0}" -f `
+        $negra = @{ Letra='E'; Modelo='WD My Passport 25E2'; Etiqueta='RESPALDO'
+                    Serie='SERIE-EN-LISTA-NEGRA'; TamDisco=4TB; TipoVol='Fixed'; Bus='USB'
+                    EsSistema=$false; EsArranque=$false }
+        $n1 = @(Get-RazonesBloqueo $negra).Count
+        Write-Host ("  serie en lista negra Y en exentos: {0}" -f `
             $(if ($n1 -gt 0) { "sigue BLOQUEADO ($n1 reglas) - OK" } else { 'FALLO CRITICO' })) `
             -ForegroundColor $(if ($n1 -gt 0) { 'Green' } else { 'Red' })
 
         $sistema = @{ Letra='C'; Modelo='Micron_2450'; Etiqueta=''; Serie='SERIE-HDD-PROPIO'
                       TamDisco=1TB; TipoVol='Fixed'; Bus='NVMe'; EsSistema=$true; EsArranque=$true }
         $n2 = @(Get-RazonesBloqueo $sistema).Count
-        Write-Host ("  Disco de sistema con serie PERMITIDA: {0}" -f `
+        Write-Host ("  Disco de sistema con serie EXENTA: {0}" -f `
             $(if ($n2 -gt 0) { "sigue BLOQUEADO ($n2 reglas) - OK" } else { 'FALLO CRITICO' })) `
             -ForegroundColor $(if ($n2 -gt 0) { 'Green' } else { 'Red' })
 
-        # Un HDD propio de 1 TB, marca bloqueada pero serie permitida: debe pasar
+        # Un HDD propio de 1 TB, marca bloqueada pero serie exenta: debe pasar
         $hdd = @{ Letra='H'; Modelo='Seagate Expansion HDD'; Etiqueta='TRABAJO'
                   Serie='SERIE-HDD-PROPIO'; TamDisco=1TB; TipoVol='Fixed'; Bus='USB'
                   EsSistema=$false; EsArranque=$false }
         $rz = @(Get-RazonesBloqueo $hdd)
-        Write-Host ("  HDD 1 TB marca bloqueada + serie permitida: {0}" -f `
+        Write-Host ("  HDD 1 TB marca bloqueada + serie exenta: {0}" -f `
             $(if ($rz.Count -eq 0) { 'OPERABLE - OK' } else { "bloqueado por: $($rz -join '; ')" })) `
             -ForegroundColor $(if ($rz.Count -eq 0) { 'Green' } else { 'Red' })
 
-        # El mismo HDD sin estar en permitidos: debe seguir bloqueado
+        # Un HDD externo GRANDE (4 TB) exento: la exencion tambien cubre el
+        # limite de tamano, que si no dejaria inutil la exencion.
+        $hddGrande = @{ Letra='H'; Modelo='Seagate Expansion HDD'; Etiqueta='RESPALDO'
+                        Serie='SERIE-HDD-PROPIO'; TamDisco=4TB; TipoVol='Fixed'; Bus='USB'
+                        EsSistema=$false; EsArranque=$false }
+        $rzg = @(Get-RazonesBloqueo $hddGrande)
+        Write-Host ("  HDD 4 TB (sobre el limite) + serie exenta: {0}" -f `
+            $(if ($rzg.Count -eq 0) { 'OPERABLE - OK' } else { "bloqueado por: $($rzg -join '; ')" })) `
+            -ForegroundColor $(if ($rzg.Count -eq 0) { 'Green' } else { 'Red' })
+
+        # El mismo HDD sin estar exento: debe seguir bloqueado
         $script:Guard.Permitidos = @()
         $rz2 = @(Get-RazonesBloqueo $hdd)
-        Write-Host ("  el mismo HDD sin permiso: {0}" -f `
+        Write-Host ("  el mismo HDD sin exencion: {0}" -f `
             $(if ($rz2.Count -gt 0) { "BLOQUEADO ($($rz2.Count) reglas) - OK" } else { 'FALLO' })) `
             -ForegroundColor $(if ($rz2.Count -gt 0) { 'Green' } else { 'Red' })
     } finally {
-        $script:Guard.Permitidos = $guardOriginal
+        $script:Guard.Permitidos = $permOriginal
+        $script:Guard.Seriales   = $serieOriginal
+    }
+
+    # --- preferencias del usuario: proteger, eximir y que se recuerde ---
+    Write-Host ''
+    Write-Host '  --- preferencias de proteccion (nivel 3) ---' -ForegroundColor Yellow
+    $prefOriginal = @{ Protegidos = @($script:Pref.Protegidos); Exentos = @($script:Pref.Exentos) }
+    $rutaOriginal = $script:PrefPath
+    try {
+        # Se escribe en una ruta temporal: la autoprueba no debe tocar las
+        # preferencias reales de quien la ejecuta.
+        $script:PrefPath = Join-Path ([IO.Path]::GetTempPath()) ("pref-prueba-{0}.json" -f ([guid]::NewGuid()))
+
+        # 1. Una memoria corriente, libre. Se protege a mano.
+        $usb = @{ Letra='J'; Modelo='SanDisk Cruzer Fit'; Etiqueta='DATOS'; Serie='USB-PRUEBA-1'
+                  TamDisco=16GB; TipoVol='Removable'; Bus='USB'; EsSistema=$false; EsArranque=$false }
+        $libre = @(Get-RazonesBloqueo $usb).Count -eq 0
+        Set-Proteccion 'USB-PRUEBA-1' 'proteger' | Out-Null
+        $trasProteger = @(Get-RazonesBloqueo $usb)
+        $ok1 = $libre -and $trasProteger.Count -gt 0
+        Write-Host ("  memoria libre -> PROTEGER -> bloqueada: {0}" -f `
+            $(if ($ok1) { 'OK' } else { "FALLO (libre antes: $libre, razones despues: $($trasProteger.Count))" })) `
+            -ForegroundColor $(if ($ok1) { 'Green' } else { 'Red' })
+
+        # 2. Se relee del disco: la preferencia tiene que sobrevivir.
+        Import-Preferencias
+        Sync-Preferencias
+        $ok2 = @(Get-RazonesBloqueo $usb).Count -gt 0 -and $script:Pref.Protegidos -contains 'USB-PRUEBA-1'
+        Write-Host ("  la preferencia sobrevive a releer el archivo: {0}" -f `
+            $(if ($ok2) { 'OK' } else { 'FALLO' })) -ForegroundColor $(if ($ok2) { 'Green' } else { 'Red' })
+
+        # 3. Se quita y vuelve a quedar operable.
+        Set-Proteccion 'USB-PRUEBA-1' 'desproteger' | Out-Null
+        $ok3 = @(Get-RazonesBloqueo $usb).Count -eq 0
+        Write-Host ("  DESPROTEGER la devuelve a operable: {0}" -f `
+            $(if ($ok3) { 'OK' } else { 'FALLO' })) -ForegroundColor $(if ($ok3) { 'Green' } else { 'Red' })
+
+        # 4. LO IMPORTANTE: eximir NO puede liberar un disco de sistema.
+        $sis = @{ Letra='C'; Modelo='Micron_2450'; Etiqueta=''; Serie='SERIE-SISTEMA'
+                  TamDisco=1TB; TipoVol='Fixed'; Bus='NVMe'; EsSistema=$true; EsArranque=$true
+                  SoloDiagnostico=$true }
+        Set-Proteccion 'SERIE-SISTEMA' 'eximir' | Out-Null
+        $rSis = @(Get-RazonesBloqueo $sis)
+        $nSis = @(Get-RazonesBloqueo $sis -SoloNucleo)
+        $ok4 = $rSis.Count -gt 0 -and $nSis.Count -gt 0
+        Write-Host ("  EXIMIR un disco de SISTEMA: {0}" -f `
+            $(if ($ok4) { "sigue BLOQUEADO ($($rSis.Count) reglas, $($nSis.Count) del nucleo) - OK" }
+              else { 'FALLO CRITICO' })) -ForegroundColor $(if ($ok4) { 'Green' } else { 'Red' })
+
+        # 5. Y el boton de su tarjeta ni siquiera se ofrece habilitado.
+        $btn = New-BotonProteccion $sis
+        $ok5 = (-not $btn.IsEnabled) -and "$($btn.Content)" -eq 'PROTEGIDO'
+        Write-Host ("  el boton de un disco de sistema sale bloqueado: {0} (texto '{1}', habilitado {2})" -f `
+            $(if ($ok5) { 'OK' } else { 'FALLO CRITICO' }), $btn.Content, $btn.IsEnabled) `
+            -ForegroundColor $(if ($ok5) { 'Green' } else { 'Red' })
+
+        # 6. Un disco sin serie no se puede recordar, y el boton lo dice.
+        $sinSerie = @{ Letra='K'; Modelo='Generico'; Etiqueta=''; Serie=''
+                       TamDisco=8GB; TipoVol='Removable'; Bus='USB'
+                       EsSistema=$false; EsArranque=$false }
+        $btn2 = New-BotonProteccion $sinSerie
+        $ok6 = -not $btn2.IsEnabled
+        Write-Host ("  disco sin numero de serie: boton deshabilitado: {0}" -f `
+            $(if ($ok6) { 'OK' } else { 'FALLO' })) -ForegroundColor $(if ($ok6) { 'Green' } else { 'Red' })
+
+        # 7. Proteger gana sobre eximir si la misma serie esta en las dos.
+        Set-Proteccion 'USB-PRUEBA-1' 'eximir'   | Out-Null
+        Set-Proteccion 'USB-PRUEBA-1' 'proteger' | Out-Null
+        $ok7 = @(Get-RazonesBloqueo $usb).Count -gt 0 -and
+               $script:Pref.Exentos -notcontains 'USB-PRUEBA-1'
+        Write-Host ("  proteger gana sobre eximir: {0}" -f `
+            $(if ($ok7) { 'OK' } else { 'FALLO CRITICO' })) -ForegroundColor $(if ($ok7) { 'Green' } else { 'Red' })
+
+        if (Test-Path -LiteralPath $script:PrefPath) {
+            Remove-Item -LiteralPath $script:PrefPath -Force -ErrorAction SilentlyContinue
+        }
+    } finally {
+        $script:PrefPath = $rutaOriginal
+        $script:Pref = $prefOriginal
+        Sync-Preferencias
     }
 
     # --- guardian de disco completo, el que usa REPARAR ---
