@@ -1,0 +1,17 @@
+{
+  "_nota": "Este archivo SOLO PUEDE AGREGAR protecciones. Nunca quita las que estan escritas en el codigo (C:, F:, Seagate, serie NT3FXPHD, discos de sistema). Si lo borras o lo dejas invalido, el programa sigue igual de protegido.",
+
+  "Letras": [],
+
+  "Seriales": [],
+
+  "Nombres": [],
+
+  "Etiquetas": [],
+
+  "_Permitidos": "Numeros de serie de discos TUYOS que pueden saltarse las reglas de MODELO y ETIQUETA (por ejemplo un HDD Seagate propio de 1 TB). NO puede saltarse la lista negra de series, ni las letras C:/F:, ni discos de sistema o arranque, ni el limite de tamano. La serie se ve en la tarjeta del disco o con: Get-Disk | Select Number,FriendlyName,SerialNumber",
+  "Permitidos": [],
+
+  "_TamMaxGB": "Solo se acepta si es MENOR que el limite base de 2048 GB (2 TB).",
+  "TamMaxGB": 2048
+}

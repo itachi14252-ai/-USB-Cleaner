@@ -1,0 +1,38 @@
+# --- Imágenes de disco y volcados ---
+# Evita subir por accidente un ISO de varios GB dejado en la carpeta
+*.iso
+*.img
+*.bin
+*.raw
+*.vhd
+*.vhdx
+
+# --- Salida de la consola y registros ---
+*.log
+*.txt.log
+registro-*.txt
+
+# --- Compilados (ps2exe) ---
+*.exe
+*.dll
+
+# --- Configuración local con datos propios ---
+# config.json SÍ se versiona (viene vacío, es la plantilla).
+# Si prefieres guardar tus seriales aparte, usa este nombre:
+config.local.json
+
+# --- Windows ---
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# --- Editores ---
+.vs/
+.vscode/
+.idea/
+*.swp
+*~

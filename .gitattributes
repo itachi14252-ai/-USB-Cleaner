@@ -1,0 +1,14 @@
+# Proyecto solo para Windows: los scripts DEBEN quedar con CRLF al clonar.
+# Un .cmd con finales de linea Unix puede fallar al ejecutarse.
+* text=auto
+
+*.ps1   text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+*.json  text eol=crlf
+*.md    text eol=crlf
+
+# Binarios: que git no los toque nunca
+*.ico   binary
+*.png   binary
+*.exe   binary
