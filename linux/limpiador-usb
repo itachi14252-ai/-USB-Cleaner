@@ -1,0 +1,1631 @@
+#!/usr/bin/env bash
+#
+#  LIMPIADOR DE USB  --  version Linux / Omarchy
+#  ---------------------------------------------
+#  Hermano de Limpiador-USB.ps1 (Windows). Mismo guardian, mismas
+#  operaciones, interfaz de terminal con gum.
+#
+#  SEGURIDAD, en tres niveles:
+#
+#    1. NUCLEO INAMOVIBLE. Ningun archivo de configuracion ni opcion
+#       del menu lo levanta:
+#         * el disco que aloja /, /boot, /efi, /home, /usr, /var o swap,
+#           resuelto a traves de LUKS, LVM y btrfs,
+#         * el disco desde el que se esta ejecutando este programa,
+#         * cualquier disco cuyo bus no sea USB / SD / MMC: los discos
+#           internos solo se listan para diagnosticar,
+#         * un disco con volumenes cifrados o LVM abiertos encima.
+#
+#    2. HEURISTICAS DE FABRICA. Modelos de HDD externo de respaldo,
+#       etiquetas y limite de tamano. Se pueden EXIMIR por disco.
+#
+#    3. DECISION DEL USUARIO, recordada por NUMERO DE SERIE.
+#
+#  El guardian se vuelve a evaluar, releyendo el disco del sistema,
+#  justo antes de escribir un solo byte.
+
+set -uo pipefail
+shopt -s extglob
+
+readonly VERSION="1.0"
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/limpiador-usb"
+CONF_FILE="$CONF_DIR/config.conf"
+PREF_FILE="$CONF_DIR/preferencias"
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/limpiador-usb"
+LOG_FILE="$LOG_DIR/registro.log"
+
+readonly GIB=1073741824
+readonly LIMITE_BASE_GB=2048
+
+# Colores ANSI (paleta HUD: rojo, dorado, gris)
+C_RST=$'\e[0m'; C_ROJO=$'\e[38;5;196m'; C_ORO=$'\e[38;5;178m'
+C_GRIS=$'\e[38;5;244m'; C_VERDE=$'\e[38;5;71m'; C_BLANCO=$'\e[1;37m'
+if [[ ! -t 1 || -n ${NO_COLOR:-} ]]; then
+    C_RST=; C_ROJO=; C_ORO=; C_GRIS=; C_VERDE=; C_BLANCO=
+fi
+
+# ================================================================
+#  UTILIDADES
+# ================================================================
+recortar() {
+    local s=$1
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# lsblk -P escapa comillas, espacios raros y barras como \xHH.
+decodificar() {
+    local s=$1 out="" c
+    while [[ $s =~ ^([^\\]*)\\x([0-9a-fA-F]{2})(.*)$ ]]; do
+        out+="${BASH_REMATCH[1]}"
+        printf -v c "\\x${BASH_REMATCH[2]}"
+        out+="$c"
+        s=${BASH_REMATCH[3]}
+    done
+    printf '%s' "$out$s"
+}
+
+formato_tam() {
+    local b=${1:-0}
+    LC_ALL=C awk -v b="$b" 'BEGIN{
+        split("B KB MB GB TB PB",u," "); i=1
+        while (b >= 1000 && i < 6) { b /= 1000; i++ }
+        printf (i==1 ? "%d %s" : "%.1f %s"), b, u[i] }'
+}
+
+registrar() {
+    mkdir -p -- "$LOG_DIR" 2>/dev/null || return 0
+    printf '%s  %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# sdb -> sdb1 ; mmcblk0 -> mmcblk0p1 ; nvme0n1 -> nvme0n1p1
+nombre_particion() {
+    local d=${1#/dev/} n=$2
+    if [[ $d == *[0-9] ]]; then printf '/dev/%sp%s' "$d" "$n"
+    else printf '/dev/%s%s' "$d" "$n"; fi
+}
+
+en_lista() {       # en_lista VALOR ELEM...   (exacto, sin mayusculas)
+    local v=${1,,} x; shift
+    for x in "$@"; do [[ ${x,,} == "$v" ]] && return 0; done
+    return 1
+}
+
+# ================================================================
+#  REGLAS BASE DEL GUARDIAN
+# ================================================================
+# Todo lo de config.conf SOLO SUMA. El nucleo no vive aqui: se
+# calcula del sistema en cada lectura y no hay variable que lo apague.
+reiniciar_reglas() {
+    G_MODELOS=(seagate portable expansion "backup plus" "one touch"
+               "my passport" "my book" elements canvio lacie)
+    G_ETIQUETAS=()
+    G_SERIALES=()      # lista negra de series (gana sobre exenciones)
+    G_PERMITIDOS=()    # series exentas de las heuristicas
+    G_PROTEGIDOS=()    # protecciones fijadas a mano en config.conf
+    G_TAM_MAX_GB=$LIMITE_BASE_GB
+    P_PROTEGIDOS=()    # lo que marcaste con PROTEGER
+    P_EXENTOS=()       # lo que marcaste con EXIMIR
+}
+
+agregar_lista() {  # agregar_lista NOMBRE_ARRAY "a, b, c" [minusculas]
+    local -n _lista=$1
+    local item
+    local IFS=','
+    for item in $2; do
+        item=$(recortar "$item")
+        [[ -z $item ]] && continue
+        [[ ${3:-} == min ]] && item=${item,,}
+        en_lista "$item" "${_lista[@]}" || _lista+=("$item")
+    done
+}
+
+# Se LEE, nunca se ejecuta: nada de 'source'. Una linea como
+#   seriales = $(rm -rf ~)
+# queda como una serie literal y rara, no como un comando.
+cargar_config() {
+    local f=${1:-$CONF_FILE} linea clave valor
+    [[ -r $f ]] || return 0
+    while IFS= read -r linea || [[ -n $linea ]]; do
+        linea=${linea%$'\r'}
+        [[ $linea =~ ^[[:space:]]*# ]] && continue
+        [[ $linea =~ ^[[:space:]]*([a-z_]+)[[:space:]]*=(.*)$ ]] || continue
+        clave=${BASH_REMATCH[1]}
+        valor=$(recortar "${BASH_REMATCH[2]}")
+        case $clave in
+            modelos)    agregar_lista G_MODELOS    "$valor" min ;;
+            etiquetas)  agregar_lista G_ETIQUETAS  "$valor" min ;;
+            seriales)   agregar_lista G_SERIALES   "$valor" ;;
+            permitidos) agregar_lista G_PERMITIDOS "$valor" ;;
+            protegidos) agregar_lista G_PROTEGIDOS "$valor" ;;
+            tam_max_gb)
+                # Solo se acepta si BAJA el limite. 10# evita que "010"
+                # se lea como octal.
+                if [[ $valor =~ ^[0-9]{1,7}$ ]] && (( 10#$valor > 0 && 10#$valor < G_TAM_MAX_GB )); then
+                    G_TAM_MAX_GB=$((10#$valor))
+                fi ;;
+        esac
+    done < "$f"
+}
+
+cargar_preferencias() {
+    local f=${1:-$PREF_FILE} tipo serie
+    P_PROTEGIDOS=(); P_EXENTOS=()
+    [[ -r $f ]] || return 0
+    while IFS=$'\t' read -r tipo serie || [[ -n ${tipo:-} ]]; do
+        serie=$(recortar "${serie:-}")
+        [[ -z $serie ]] && continue
+        case $tipo in
+            protegido) en_lista "$serie" "${P_PROTEGIDOS[@]}" || P_PROTEGIDOS+=("$serie") ;;
+            exento)    en_lista "$serie" "${P_EXENTOS[@]}"    || P_EXENTOS+=("$serie") ;;
+        esac
+    done < "$f"
+}
+
+guardar_preferencias() {
+    local f=${1:-$PREF_FILE} tmp s
+    mkdir -p -- "$(dirname -- "$f")" || return 1
+    tmp=$(mktemp "${f}.XXXXXX") || return 1
+    {
+        printf '# Lo escribe el programa (PROTEGER / EXIMIR). Se puede borrar sin miedo:\n'
+        printf '# sin este archivo el programa arranca igual de protegido.\n'
+        for s in "${P_PROTEGIDOS[@]}"; do printf 'protegido\t%s\n' "$s"; done
+        for s in "${P_EXENTOS[@]}";    do printf 'exento\t%s\n' "$s"; done
+    } > "$tmp" && mv -f -- "$tmp" "$f"
+}
+
+quitar_de() {      # quitar_de NOMBRE_ARRAY VALOR
+    local -n _arr=$1
+    local v=${2,,} x nuevo=()
+    for x in "${_arr[@]}"; do [[ ${x,,} == "$v" ]] || nuevo+=("$x"); done
+    _arr=("${nuevo[@]}")
+}
+
+# accion: proteger | desproteger | eximir | reactivar
+cambiar_proteccion() {
+    local serie accion=$2 f=${3:-$PREF_FILE}
+    serie=$(recortar "$1")
+    if [[ -z $serie ]]; then
+        echo "Este disco no reporta numero de serie: no se puede recordar." >&2
+        return 1
+    fi
+    cargar_preferencias "$f"
+    case $accion in
+        proteger)    en_lista "$serie" "${P_PROTEGIDOS[@]}" || P_PROTEGIDOS+=("$serie") ;;
+        desproteger) quitar_de P_PROTEGIDOS "$serie" ;;
+        eximir)      en_lista "$serie" "${P_EXENTOS[@]}" || P_EXENTOS+=("$serie") ;;
+        reactivar)   quitar_de P_EXENTOS "$serie" ;;
+        *) return 2 ;;
+    esac
+    guardar_preferencias "$f"
+}
+
+# Protecciones y lista negra comparan por CONTENIDO (bloquear de mas es
+# seguro). Las exenciones comparan EXACTO: una exencion corta como "A1"
+# no puede liberar cualquier disco cuya serie la contenga.
+serie_contiene() {
+    local serie=${1,,} patron=${2,,}
+    [[ -n $patron && $serie == *"$patron"* ]]
+}
+
+serie_exenta() {
+    local serie x
+    serie=$(recortar "${1:-}")
+    [[ -z $serie ]] && return 1
+    for x in "${G_SERIALES[@]}"; do serie_contiene "$serie" "$x" && return 1; done
+    en_lista "$serie" "${G_PERMITIDOS[@]}" "${P_EXENTOS[@]}"
+}
+
+serie_protegida() {
+    local serie=$1 x
+    [[ -z $serie ]] && return 1
+    for x in "${G_PROTEGIDOS[@]}" "${P_PROTEGIDOS[@]}"; do
+        serie_contiene "$serie" "$x" && { printf '%s' "$x"; return 0; }
+    done
+    return 1
+}
+
+bus_extraible() {
+    local d=$1 tran=${D_TRAN[$1]:-}
+    [[ ${tran,,} == usb || ${tran,,} == mmc || ${tran,,} == sd || $d == mmcblk* ]]
+}
+
+# ================================================================
+#  EL GUARDIAN
+#  razones_bloqueo DISCO [nucleo]  ->  una razon por linea.
+#  Vacio = se puede operar. Con "nucleo" devuelve solo lo que
+#  NINGUNA exencion levanta.
+# ================================================================
+razones_bloqueo() {
+    local d=$1 solo=${2:-} serie modelo tran x p etq pr
+    local -a r=()
+    serie=$(recortar "${D_SERIE[$d]:-}")
+    tran=${D_TRAN[$d]:-}
+
+    # ============ NUCLEO INAMOVIBLE ============
+    if [[ -n ${SIS_RAZON[$d]:-} ]]; then
+        while IFS= read -r x; do [[ -n $x ]] && r+=("$x"); done <<< "${SIS_RAZON[$d]}"
+    fi
+    if ! bus_extraible "$d"; then
+        r+=("BUS ${tran:-DESCONOCIDO} - SOLO DIAGNOSTICO, NINGUNA ESCRITURA PERMITIDA")
+        r[-1]=${r[-1]^^}
+    fi
+    [[ -n ${EN_USO[$d]:-} ]] && r+=("${EN_USO[$d]}")
+
+    if [[ $solo != nucleo ]]; then
+        # ============ DECISION DEL USUARIO ============
+        if pr=$(serie_protegida "$serie"); then
+            r+=("PROTEGIDO POR TI - SERIE $pr (se quita con DESPROTEGER)")
+        fi
+        # ============ LISTA NEGRA DE SERIES ============
+        for x in "${G_SERIALES[@]}"; do
+            serie_contiene "$serie" "$x" && r+=("NUMERO DE SERIE BLINDADO ($x)")
+        done
+        # ============ HEURISTICAS, EXIMIBLES ============
+        if ! serie_exenta "$serie"; then
+            modelo="${D_VENDOR[$d]:-} ${D_MODELO[$d]:-}"
+            modelo=${modelo,,}
+            for x in "${G_MODELOS[@]}"; do
+                [[ $modelo == *"$x"* ]] && r+=("MODELO CONTIENE '${x^^}' - DISCO DE RESPALDO")
+            done
+            for p in ${D_PARTES[$d]:-}; do
+                etq=${P_ETIQ[$p]:-}
+                [[ -z $etq ]] && continue
+                for x in "${G_ETIQUETAS[@]}"; do
+                    [[ ${etq,,} == *"$x"* ]] && r+=("ETIQUETA BLINDADA '$etq'")
+                done
+            done
+            if (( ${D_TAM[$d]:-0} > G_TAM_MAX_GB * GIB )); then
+                r+=("EXCEDE EL LIMITE DE $G_TAM_MAX_GB GB ($(formato_tam "${D_TAM[$d]}")) - SE ASUME DISCO DE RESPALDO")
+            fi
+        fi
+    fi
+    (( ${#r[@]} )) && printf '%s\n' "${r[@]}" | awk '!visto[$0]++'
+    return 0
+}
+
+# Estado de proteccion de una tarjeta, para decidir que se ofrece.
+#   nucleo | protegido | exento | bloqueado | libre | sinserie
+estado_proteccion() {
+    local d=$1 serie
+    serie=$(recortar "${D_SERIE[$d]:-}")
+    [[ -n $(razones_bloqueo "$d" nucleo) ]] && { echo nucleo; return; }
+    [[ -z $serie ]] && { echo sinserie; return; }
+    serie_protegida "$serie" >/dev/null && { echo protegido; return; }
+    serie_exenta "$serie" && { echo exento; return; }
+    [[ -n $(razones_bloqueo "$d") ]] && { echo bloqueado; return; }
+    echo libre
+}
+
+# ================================================================
+#  LECTURA DE DISCOS
+# ================================================================
+limpiar_datos() {
+    unset D_TRAN D_TAM D_MODELO D_SERIE D_VENDOR D_RM D_RO D_ROTA D_PTTYPE \
+          D_WWN D_LOGSEC D_PHYSEC D_PARTES P_PADRE P_FSTYPE P_ETIQ P_TAM \
+          P_MONT SIS_RAZON EN_USO PADRES TIPO
+    declare -gA D_TRAN=() D_TAM=() D_MODELO=() D_SERIE=() D_VENDOR=() D_RM=() \
+                D_RO=() D_ROTA=() D_PTTYPE=() D_WWN=() D_LOGSEC=() D_PHYSEC=() \
+                D_PARTES=() P_PADRE=() P_FSTYPE=() P_ETIQ=() P_TAM=() P_MONT=() \
+                SIS_RAZON=() EN_USO=() PADRES=() TIPO=()
+    DISCOS=()
+}
+
+# Lee lineas de 'lsblk -bnpP' por stdin. Se parsea con regex y NUNCA
+# con eval: una etiqueta puede traer cualquier cosa.
+procesar_lsblk() {
+    local linea k v nombre tipo pk
+    local -A kv
+    while IFS= read -r linea; do
+        kv=()
+        while [[ $linea =~ ^[[:space:]]*([A-Za-z0-9_:-]+)=\"([^\"]*)\"(.*)$ ]]; do
+            k=${BASH_REMATCH[1]//[-:]/_}
+            v=$(decodificar "${BASH_REMATCH[2]}")
+            kv[$k]=$v
+            linea=${BASH_REMATCH[3]}
+        done
+        nombre=${kv[NAME]:-}; nombre=${nombre#/dev/}
+        [[ -z $nombre ]] && continue
+        tipo=${kv[TYPE]:-}
+        pk=${kv[PKNAME]:-}; pk=${pk#/dev/}
+        TIPO[$nombre]=$tipo
+        if [[ -n $pk && " ${PADRES[$nombre]:-} " != *" $pk "* ]]; then
+            PADRES[$nombre]+=" $pk"
+        fi
+        case $tipo in
+            disk)
+                [[ $nombre =~ ^(loop|zram|ram|sr|fd) ]] && continue
+                (( ${kv[SIZE]:-0} > 0 )) || continue          # lector sin tarjeta
+                [[ -n ${D_TAM[$nombre]:-} ]] && continue      # repetido
+                DISCOS+=("$nombre")
+                D_TRAN[$nombre]=${kv[TRAN]:-}
+                D_TAM[$nombre]=${kv[SIZE]:-0}
+                D_MODELO[$nombre]=$(recortar "${kv[MODEL]:-}")
+                D_VENDOR[$nombre]=$(recortar "${kv[VENDOR]:-}")
+                D_SERIE[$nombre]=$(recortar "${kv[SERIAL]:-}")
+                D_RM[$nombre]=${kv[RM]:-0}
+                D_RO[$nombre]=${kv[RO]:-0}
+                D_ROTA[$nombre]=${kv[ROTA]:-}
+                D_PTTYPE[$nombre]=${kv[PTTYPE]:-}
+                D_WWN[$nombre]=${kv[WWN]:-}
+                D_LOGSEC[$nombre]=${kv[LOG_SEC]:-}
+                D_PHYSEC[$nombre]=${kv[PHY_SEC]:-}
+                D_PARTES[$nombre]=${D_PARTES[$nombre]:-}
+                # Memoria formateada "en crudo", sin tabla de particiones:
+                # el propio disco hace de particion.
+                if [[ -n ${kv[FSTYPE]:-} && -z ${kv[PTTYPE]:-} && ${kv[FSTYPE]} != iso9660 ]]; then
+                    P_PADRE[$nombre]=$nombre
+                    P_FSTYPE[$nombre]=${kv[FSTYPE]}
+                    P_ETIQ[$nombre]=${kv[LABEL]:-}
+                    P_TAM[$nombre]=${kv[SIZE]:-0}
+                    P_MONT[$nombre]=${kv[MOUNTPOINT]:-}
+                    D_PARTES[$nombre]=" $nombre"
+                fi
+                ;;
+            part)
+                P_PADRE[$nombre]=$pk
+                P_FSTYPE[$nombre]=${kv[FSTYPE]:-}
+                P_ETIQ[$nombre]=${kv[LABEL]:-}
+                P_TAM[$nombre]=${kv[SIZE]:-0}
+                P_MONT[$nombre]=${kv[MOUNTPOINT]:-}
+                [[ " ${D_PARTES[$pk]:-} " == *" $nombre "* ]] || D_PARTES[$pk]+=" $nombre"
+                ;;
+            crypt|lvm|raid*|dm|mpath|md)
+                local raiz
+                for raiz in $(discos_bajo "$nombre"); do
+                    EN_USO[$raiz]="TIENE UN VOLUMEN ${tipo^^} ABIERTO ENCIMA ($nombre) - CIERRALO ANTES"
+                done
+                ;;
+        esac
+    done
+}
+
+# A que disco(s) fisicos pertenece un dispositivo, subiendo por
+# LUKS -> particion -> disco, o LVM -> varios discos.
+discos_bajo() {
+    local inicio=${1#/dev/} actual p
+    local -a cola=("$inicio") vistos=()
+    while (( ${#cola[@]} )); do
+        actual=${cola[0]}; cola=("${cola[@]:1}")
+        [[ " ${vistos[*]} " == *" $actual "* ]] && continue
+        vistos+=("$actual")
+        if [[ ${TIPO[$actual]:-} == disk ]]; then printf '%s\n' "$actual"; continue; fi
+        for p in ${PADRES[$actual]:-}; do cola+=("$p"); done
+    done
+}
+
+marcar_sistema() {     # marcar_sistema DISPOSITIVO RAZON
+    local src=${1%%\[*} razon=$2 d
+    src=${src#/dev/}
+    for d in $(discos_bajo "$src"); do
+        [[ $'\n'"${SIS_RAZON[$d]:-}"$'\n' == *$'\n'"$razon"$'\n'* ]] && continue
+        SIS_RAZON[$d]+="${SIS_RAZON[$d]:+$'\n'}$razon"
+    done
+}
+
+razon_de_montaje() {   # que significa que un disco aloje este punto de montaje
+    case $1 in
+        /)                          echo "DISCO DEL SISTEMA OPERATIVO (/)" ;;
+        /boot|/boot/efi|/efi)       echo "DISCO DE ARRANQUE ($1)" ;;
+        /home|/usr|/var|/opt|/srv|/root|/nix|/gnu|/.snapshots)
+                                    echo "ALOJA $1 DEL SISTEMA" ;;
+        /usr/*|/var/*)              echo "ALOJA $1 DEL SISTEMA" ;;
+        *) return 1 ;;
+    esac
+}
+
+detectar_sistema() {
+    local tgt src razon
+    while read -r tgt src; do
+        tgt=$(decodificar "$tgt"); src=$(decodificar "$src")
+        [[ $src == /dev/* ]] || continue
+        razon=$(razon_de_montaje "$tgt") || continue
+        marcar_sistema "$src" "$razon"
+    done < <(findmnt -rn -o TARGET,SOURCE 2>/dev/null)
+
+    while read -r src; do
+        [[ $src == /dev/* && $src != /dev/zram* ]] && marcar_sistema "$src" "ALOJA SWAP ACTIVO (${src#/dev/})"
+    done < <(swapon --show=NAME --noheadings --raw 2>/dev/null)
+
+    # Si lo llevas en una memoria y lo ejecutas desde ahi, esa memoria
+    # queda intocable mientras corre.
+    src=$(findmnt -n -o SOURCE --target "$SELF" 2>/dev/null)
+    [[ $src == /dev/* ]] && marcar_sistema "$src" "EL PROGRAMA SE ESTA EJECUTANDO DESDE ESTE DISCO"
+}
+
+leer_discos() {
+    limpiar_datos
+    local cols=NAME,PKNAME,TYPE,TRAN,RM,SIZE,MODEL,SERIAL,VENDOR,RO,ROTA,PTTYPE,WWN,FSTYPE,LABEL,MOUNTPOINT,LOG-SEC,PHY-SEC
+    procesar_lsblk < <(lsblk -bnpP -o "$cols" 2>/dev/null)
+    detectar_sistema
+}
+
+# A que disco fisico pertenece una ruta (carpeta o archivo). Sirve para
+# no guardar lo recuperado en el mismo disco, ni grabar una imagen que
+# vive en el disco de destino.
+discos_de_ruta() {
+    local ruta=$1 src
+    while [[ ! -e $ruta && $ruta != / ]]; do ruta=$(dirname -- "$ruta"); done
+    src=$(findmnt -n -o SOURCE --target "$ruta" 2>/dev/null)
+    src=${src%%\[*}
+    [[ $src == /dev/* ]] && discos_bajo "${src#/dev/}"
+}
+
+# Huella en vivo: lo que el disco dice ser AHORA. La serie sola no
+# basta: los puentes USB baratos inventan series de relleno (un JMicron
+# reporta "123467"), asi que se compara tambien tamano, modelo y WWN.
+huella_guardada() {
+    local d=$1
+    printf '%s|%s|%s|%s' "${D_SERIE[$d]:-}" "${D_TAM[$d]:-}" "${D_MODELO[$d]:-}" "${D_WWN[$d]:-}"
+}
+
+huella_en_vivo() {
+    local d=$1 linea k v
+    local -A kv=()
+    linea=$(lsblk -dbnP -o SERIAL,SIZE,MODEL,WWN -- "/dev/$d" 2>/dev/null) || return 1
+    while [[ $linea =~ ^[[:space:]]*([A-Z_]+)=\"([^\"]*)\"(.*)$ ]]; do
+        k=${BASH_REMATCH[1]}; v=$(decodificar "${BASH_REMATCH[2]}")
+        kv[$k]=$(recortar "$v"); linea=${BASH_REMATCH[3]}
+    done
+    printf '%s|%s|%s|%s' "${kv[SERIAL]:-}" "${kv[SIZE]:-}" "${kv[MODEL]:-}" "${kv[WWN]:-}"
+}
+
+# La TERCERA verificacion: justo antes de escribir, se relee todo el
+# sistema y se vuelve a pasar el guardian con datos frescos.
+verificar_antes_de_escribir() {
+    local d=$1 esperada=$2 viva
+    if [[ ! -b /dev/$d ]]; then
+        echo "EL DISCO /dev/$d YA NO EXISTE"; return 1
+    fi
+    viva=$(huella_en_vivo "$d") || { echo "NO SE PUDO RELEER /dev/$d"; return 1; }
+    if [[ $viva != "$esperada" ]]; then
+        echo "/dev/$d YA NO ES EL MISMO DISCO"
+        echo "  esperado: $esperada"
+        echo "  ahora:    $viva"
+        return 1
+    fi
+    leer_discos
+    cargar_preferencias
+    local rz
+    rz=$(razones_bloqueo "$d")
+    if [[ -n $rz ]]; then
+        echo "EL GUARDIAN BLOQUEA /dev/$d:"
+        sed 's/^/  - /' <<< "$rz"
+        return 1
+    fi
+    return 0
+}
+
+# ================================================================
+#  INTERFAZ (gum, con respaldo en bash puro)
+# ================================================================
+TIENE_GUM=0
+command -v gum >/dev/null 2>&1 && TIENE_GUM=1
+
+ui_banner() {
+    clear 2>/dev/null || true
+    if (( TIENE_GUM )); then
+        gum style --border double --border-foreground 178 --foreground 196 \
+            --bold --padding "0 3" --margin "0 1" \
+            "///  LIMPIADOR DE USB  ///" "linux / omarchy  ·  v$VERSION"
+    else
+        printf '%s\n' "${C_ORO}╔══════════════════════════════════╗${C_RST}"
+        printf '%s\n' "${C_ORO}║${C_ROJO}   ///  LIMPIADOR DE USB  ///     ${C_ORO}║${C_RST}"
+        printf '%s\n' "${C_ORO}║${C_GRIS}     linux / omarchy · v$VERSION        ${C_ORO}║${C_RST}"
+        printf '%s\n' "${C_ORO}╚══════════════════════════════════╝${C_RST}"
+    fi
+}
+
+ui_titulo() { printf '\n%s%s%s\n' "$C_ORO" "--- $* ---" "$C_RST"; }
+ui_ok()     { printf '%s%s%s\n' "$C_VERDE" "$*" "$C_RST"; }
+ui_error()  { printf '%s%s%s\n' "$C_ROJO"  "$*" "$C_RST" >&2; }
+ui_info()   { printf '%s%s%s\n' "$C_GRIS"  "$*" "$C_RST"; }
+
+# ui_elegir "encabezado" opcion...   -> imprime la elegida; 1 si se cancela
+ui_elegir() {
+    local enc=$1; shift
+    (( $# )) || return 1
+    if (( TIENE_GUM )); then
+        gum choose --header "$enc" --cursor "› " --height 22 \
+            --cursor.foreground 196 --header.foreground 178 "$@"
+        return
+    fi
+    local i=1 op n
+    printf '%s%s%s\n' "$C_ORO" "$enc" "$C_RST" >&2
+    for op in "$@"; do printf '  %2d) %s\n' "$i" "$op" >&2; ((i++)); done
+    read -r -p "  numero (vacio = volver): " n </dev/tty || return 1
+    [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= $# )) || return 1
+    printf '%s\n' "${!n}"
+}
+
+ui_confirmar() {       # pregunta cerrada, por defecto NO
+    if (( TIENE_GUM )); then
+        gum confirm --default=false --affirmative "Si" --negative "No" "$1"
+        return
+    fi
+    local r
+    read -r -p "$1 [s/N] " r </dev/tty || return 1
+    [[ ${r,,} == s || ${r,,} == si || ${r,,} == y ]]
+}
+
+ui_pedir() {           # ui_pedir "pregunta" [valor_inicial]
+    if (( TIENE_GUM )); then
+        gum input --prompt "› " --header "$1" --value "${2:-}" --width 70
+        return
+    fi
+    local r
+    read -r -e -p "$1 " -i "${2:-}" r </dev/tty || return 1
+    printf '%s\n' "$r"
+}
+
+# Para lo destructivo: hay que ESCRIBIR exactamente el texto.
+ui_escribir_para_confirmar() {
+    local exacto=$1 r
+    printf '\n%sPara continuar escribe exactamente:%s  %s%s%s\n' \
+        "$C_ORO" "$C_RST" "$C_BLANCO" "$exacto" "$C_RST"
+    r=$(ui_pedir "confirmacion:") || return 1
+    [[ $r == "$exacto" ]]
+}
+
+ui_pausa() {
+    printf '\n'
+    read -r -s -n 1 -p "${C_GRIS}[cualquier tecla para volver]${C_RST}" _ </dev/tty || true
+    printf '\n'
+}
+
+# ================================================================
+#  TARJETAS
+# ================================================================
+linea_disco() {        # una linea por disco, para la lista principal
+    local d=$1 rz marca n
+    rz=$(razones_bloqueo "$d")
+    if [[ -z $rz ]]; then
+        marca="● PERMITIDA"
+    else
+        n=$(grep -c . <<< "$rz")
+        if [[ -n $(razones_bloqueo "$d" nucleo) ]]; then marca="■ BLINDADA (nucleo)"
+        else marca="■ BLINDADA ($n regla$([[ $n -gt 1 ]] && echo s))"; fi
+    fi
+    printf '%-9s %-28.28s %9s  %s' "$d" "$(nombre_visible "$d")" "$(formato_tam "${D_TAM[$d]}")" "$marca"
+}
+
+nombre_visible() {
+    local d=$1 m
+    m=$(recortar "${D_VENDOR[$d]:-} ${D_MODELO[$d]:-}")
+    printf '%s' "${m:-(sin modelo)}"
+}
+
+mostrar_tarjeta() {
+    local d=$1 p rz est tipo_medio
+    case ${D_ROTA[$d]:-} in 1) tipo_medio="rotacional (dice el disco)";; 0) tipo_medio="estado solido (dice el disco)";; *) tipo_medio="?";; esac
+    printf '\n%s[ /dev/%s ]%s  %s%s%s\n' "$C_ORO" "$d" "$C_RST" "$C_BLANCO" "$(nombre_visible "$d")" "$C_RST"
+    printf '  %-10s %s\n' "tamano" "$(formato_tam "${D_TAM[$d]}")" \
+                          "bus" "${D_TRAN[$d]:-desconocido}" \
+                          "serie" "${D_SERIE[$d]:-(no reporta)}" \
+                          "tabla" "${D_PTTYPE[$d]:-ninguna}" \
+                          "medio" "$tipo_medio"
+    [[ ${D_RO[$d]:-0} == 1 ]] && printf '  %s%s%s\n' "$C_ROJO" "SOLO LECTURA (bloqueado por hardware o por el kernel)" "$C_RST"
+    for p in ${D_PARTES[$d]:-}; do
+        printf '  %s└ %-12s%s %-7s %-16.16s %9s  %s\n' "$C_GRIS" "$p" "$C_RST" \
+            "${P_FSTYPE[$p]:--}" "${P_ETIQ[$p]:-(sin etiqueta)}" \
+            "$(formato_tam "${P_TAM[$p]:-0}")" "${P_MONT[$p]:-}"
+    done
+    [[ -z ${D_PARTES[$d]// /} ]] && ui_info "  (sin particiones: disco vacio o recien grabado con una imagen)"
+    rz=$(razones_bloqueo "$d")
+    if [[ -n $rz ]]; then
+        printf '  %s/// UNIDAD BLINDADA ///%s\n' "$C_ROJO" "$C_RST"
+        sed "s/^/    ${C_ROJO}- /; s/\$/${C_RST}/" <<< "$rz"
+    else
+        printf '  %s● PERMITIDA%s\n' "$C_VERDE" "$C_RST"
+    fi
+    est=$(estado_proteccion "$d")
+    case $est in
+        exento)   ui_info "  exenta de las heuristicas por ti (se deshace con REACTIVAR)";;
+        sinserie) ui_info "  sin numero de serie: PROTEGER / EXIMIR no pueden recordarla";;
+    esac
+}
+
+# ================================================================
+#  DEPENDENCIAS Y PERMISOS
+# ================================================================
+declare -A PAQUETE=(
+    [gum]=gum [mkfs.vfat]=dosfstools [mkfs.exfat]=exfatprogs [mkfs.ntfs]=ntfs-3g
+    [mkfs.ext4]=e2fsprogs [smartctl]=smartmontools [photorec]=testdisk
+    [udisksctl]=udisks2 [xz]=xz [zstd]=zstd [unzip]=unzip [gzip]=gzip
+    [sfdisk]=util-linux [wipefs]=util-linux [blockdev]=util-linux
+)
+
+necesitar() {          # necesitar comando...  (ofrece instalar lo que falte)
+    local c faltan=() pk=()
+    for c in "$@"; do
+        command -v "$c" >/dev/null 2>&1 && continue
+        faltan+=("$c")
+        en_lista "${PAQUETE[$c]:-$c}" "${pk[@]}" || pk+=("${PAQUETE[$c]:-$c}")
+    done
+    (( ${#faltan[@]} )) || return 0
+    ui_error "Faltan programas: ${faltan[*]}  (paquetes: ${pk[*]})"
+    command -v pacman >/dev/null 2>&1 || return 1
+    ui_confirmar "¿Instalarlos ahora con pacman?" || return 1
+    sudo pacman -S --needed -- "${pk[@]}" || return 1
+    for c in "${faltan[@]}"; do command -v "$c" >/dev/null 2>&1 || return 1; done
+}
+
+pedir_sudo() {
+    sudo -n true 2>/dev/null && return 0
+    ui_info "Esta operacion necesita permisos de administrador (sudo)."
+    sudo -v
+}
+
+fuente_de_montaje() { findmnt -n -o SOURCE --mountpoint "$1" 2>/dev/null | head -n1; }
+montaje_de()        { findmnt -n -o TARGET --source "$1" 2>/dev/null | head -n1; }
+
+desmontar_particion() {
+    local dev=$1 intentos=0
+    while [[ -n $(montaje_de "$dev") ]]; do
+        (( intentos++ >= 8 )) && { ui_error "No se pudo desmontar $dev (algo lo esta usando)"; return 1; }
+        if command -v udisksctl >/dev/null 2>&1; then
+            udisksctl unmount -b "$dev" >/dev/null 2>&1 || sudo umount -- "$dev" 2>/dev/null
+        else
+            sudo umount -- "$dev" 2>/dev/null
+        fi
+    done
+    return 0
+}
+
+desmontar_disco() {
+    local d=$1 p
+    for p in ${D_PARTES[$d]:-}; do desmontar_particion "/dev/$p" || return 1; done
+    desmontar_particion "/dev/$d"
+}
+
+esperar_dispositivo() {  # espera activa: con un retardo fijo, a veces falla
+    local dev=$1 i
+    for (( i = 0; i < 30; i++ )); do
+        udevadm settle --timeout=2 2>/dev/null
+        [[ -b $dev ]] && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+# ================================================================
+#  SISTEMAS DE ARCHIVOS
+# ================================================================
+etiqueta_valida() {    # etiqueta_valida FS TEXTO
+    local fs=$1 e=$2 max
+    case $fs in
+        vfat)  e=${e^^}; e=${e//[^A-Z0-9 _-]/}; max=11 ;;
+        exfat) e=${e//[\"*\/:<>?\\|]/}; max=15 ;;
+        ntfs)  e=${e//[\"*\/:<>?\\|]/}; max=32 ;;
+        *)     max=16 ;;
+    esac
+    e=$(recortar "${e:0:max}")
+    printf '%s' "${e:-USB}"
+}
+
+crear_fs() {           # crear_fs DISPOSITIVO FS ETIQUETA
+    local dev=$1 fs=$2 etq=$3
+    case $fs in
+        vfat)  sudo mkfs.vfat -F 32 -n "$etq" "$dev" ;;
+        exfat) sudo mkfs.exfat -L "$etq" "$dev" ;;
+        ntfs)  sudo mkfs.ntfs -Q -F -L "$etq" "$dev" ;;
+        # root_owner: sin esto la raiz queda de root y no podrias escribir
+        ext4)  sudo mkfs.ext4 -F -L "$etq" -E "root_owner=$(id -u):$(id -g)" "$dev" ;;
+        *) return 2 ;;
+    esac
+}
+
+comando_mkfs() { case $1 in vfat) echo mkfs.vfat;; exfat) echo mkfs.exfat;; ntfs) echo mkfs.ntfs;; ext4) echo mkfs.ext4;; esac; }
+tipo_mbr()     { case $1 in vfat) echo c;; exfat|ntfs) echo 7;; ext4) echo 83;; esac; }
+tipo_gpt()     { case $1 in ext4) echo 0FC63DAF-8483-4772-8E79-3D69D8477DE4;; *) echo EBD0A0A2-B9E5-4433-87C0-68B6B72699C7;; esac; }
+fs_automatico(){ (( $1 > 32 * GIB )) && echo exfat || echo vfat; }
+nombre_fs()    { case $1 in vfat) echo FAT32;; exfat) echo exFAT;; ntfs) echo NTFS;; ext4) echo ext4;; *) echo "$1";; esac; }
+
+# ================================================================
+#  LIMPIAR  -- borra todo lo de la raiz de una particion
+# ================================================================
+ruta_limpiable() {     # ruta_limpiable PARTICION PUNTO_DE_MONTAJE
+    local p=$1 mnt=$2
+    [[ -n $mnt && $mnt == /* && $mnt != / && -d $mnt ]] || return 1
+    [[ $(fuente_de_montaje "$mnt") == "/dev/$p" ]]
+}
+
+op_limpiar() {
+    local p=$1 d=${P_PADRE[$1]} huella mnt n
+    huella=$(huella_guardada "$d")
+    [[ -n ${P_FSTYPE[$p]:-} ]] || { ui_error "/dev/$p no tiene un sistema de archivos legible. Usa FORMATEAR o REPARAR."; return 1; }
+    mnt=$(montaje_de "/dev/$p")
+    if [[ -z $mnt ]]; then
+        necesitar udisksctl || return 1
+        udisksctl mount -b "/dev/$p" >/dev/null || { ui_error "No se pudo montar /dev/$p"; return 1; }
+        mnt=$(montaje_de "/dev/$p")
+    fi
+    n=$(find "$mnt" -mindepth 1 -maxdepth 1 ! -name 'System Volume Information' 2>/dev/null | wc -l)
+    ui_titulo "LIMPIAR /dev/$p"
+    printf '  montada en  %s\n  etiqueta    %s\n  elementos   %s en la raiz (con ocultos)\n' \
+        "$mnt" "${P_ETIQ[$p]:-(sin etiqueta)}" "$n"
+    ui_error "  Se borran sin pasar por la papelera."
+    (( n > 0 )) || { ui_ok "  Ya esta vacia."; return 0; }
+    ui_escribir_para_confirmar "$p" || { ui_info "Cancelado."; return 1; }
+    pedir_sudo || return 1
+    verificar_antes_de_escribir "$d" "$huella" || return 1
+    ruta_limpiable "$p" "$mnt" || { ui_error "El punto de montaje cambio. Abortado."; return 1; }
+    sudo find "$mnt" -mindepth 1 -maxdepth 1 ! -name 'System Volume Information' \
+        -exec rm -rf --one-file-system -- {} + && sync
+    n=$(find "$mnt" -mindepth 1 -maxdepth 1 ! -name 'System Volume Information' 2>/dev/null | wc -l)
+    registrar "LIMPIAR /dev/$p ($(huella_guardada "$d")) quedan=$n"
+    (( n == 0 )) && ui_ok "Listo: /dev/$p quedo vacia." || ui_error "Quedaron $n elementos que no se pudieron borrar."
+}
+
+# ================================================================
+#  FORMATEAR  -- formato rapido de una particion, conserva etiqueta
+# ================================================================
+op_formatear() {
+    local p=$1 d=${P_PADRE[$1]} huella fs etq num
+    huella=$(huella_guardada "$d")
+    fs=$(fs_automatico "${P_TAM[$p]:-0}")
+    etq=$(etiqueta_valida "$fs" "${P_ETIQ[$p]:-USB}")
+    necesitar "$(comando_mkfs "$fs")" || return 1
+    ui_titulo "FORMATEAR /dev/$p"
+    printf '  tamano      %s\n  formato     %s  (exFAT por encima de 32 GB, FAT32 si no)\n  etiqueta    %s\n' \
+        "$(formato_tam "${P_TAM[$p]}")" "$(nombre_fs "$fs")" "$etq"
+    ui_error "  Todo lo que contiene se pierde."
+    ui_escribir_para_confirmar "$p" || { ui_info "Cancelado."; return 1; }
+    pedir_sudo || return 1
+    desmontar_particion "/dev/$p" || return 1
+    verificar_antes_de_escribir "$d" "$huella" || return 1
+    crear_fs "/dev/$p" "$fs" "$etq" || { ui_error "Fallo el formateo. Prueba REPARAR sobre el disco."; return 1; }
+    if [[ $p != "$d" && ${D_PTTYPE[$d]:-} == dos && -r /sys/class/block/$p/partition ]]; then
+        num=$(< "/sys/class/block/$p/partition")
+        sudo sfdisk --quiet --part-type "/dev/$d" "$num" "$(tipo_mbr "$fs")" >/dev/null 2>&1 || true
+    fi
+    udevadm settle 2>/dev/null
+    registrar "FORMATEAR /dev/$p $fs '$etq' ($(huella_guardada "$d"))"
+    ui_ok "Listo: /dev/$p en $(nombre_fs "$fs") con etiqueta '$etq'."
+}
+
+# ================================================================
+#  REPARAR  -- tabla nueva en el DISCO COMPLETO + una particion
+# ================================================================
+op_reparar() {
+    local d=$1 huella esq fs etq op dev tabla p1
+    huella=$(huella_guardada "$d")
+    ui_titulo "REPARAR /dev/$d  ($(nombre_visible "$d"), $(formato_tam "${D_TAM[$d]}"))"
+    ui_info "Borra la tabla de particiones del disco ENTERO, crea una particion y la formatea."
+    ui_info "Sirve cuando formatear falla, o para devolver a la normalidad una memoria grabada con una imagen."
+    op=$(ui_elegir "Esquema de particiones" "MBR   lo mas compatible" "GPT   necesario por encima de 2 TB") || return 1
+    esq=${op%% *}
+    if [[ $esq == MBR ]] && (( ${D_TAM[$d]} > 2199023255552 )); then
+        ui_info "Este disco pasa de 2 TB: MBR no lo cubre entero. Se usara GPT."; esq=GPT
+    fi
+    op=$(ui_elegir "Formato" "AUTO    FAT32 hasta 32 GB, exFAT por encima" "FAT32" "exFAT" "NTFS" "ext4    solo Linux") || return 1
+    case ${op%% *} in
+        AUTO) fs=$(fs_automatico "${D_TAM[$d]}") ;; FAT32) fs=vfat ;; exFAT) fs=exfat ;; NTFS) fs=ntfs ;; ext4) fs=ext4 ;;
+    esac
+    p1=$(awk '{print $1}' <<< "${D_PARTES[$d]:-}")
+    etq=USB
+    [[ -n $p1 && -n ${P_ETIQ[$p1]:-} ]] && etq=${P_ETIQ[$p1]}
+    etq=$(ui_pedir "Etiqueta:" "$(etiqueta_valida "$fs" "$etq")") || return 1
+    etq=$(etiqueta_valida "$fs" "$etq")
+    necesitar sfdisk wipefs blockdev "$(comando_mkfs "$fs")" || return 1
+
+    printf '\n  disco    /dev/%s  serie %s\n  esquema  %s\n  formato  %s\n  etiqueta %s\n' \
+        "$d" "${D_SERIE[$d]:-(no reporta)}" "$esq" "$(nombre_fs "$fs")" "$etq"
+    ui_error "  Se borra TODO el disco, todas sus particiones."
+    ui_escribir_para_confirmar "DISCO $d" || { ui_info "Cancelado."; return 1; }
+    pedir_sudo || return 1
+    desmontar_disco "$d" || return 1
+    verificar_antes_de_escribir "$d" "$huella" || return 1
+
+    sudo blockdev --setrw "/dev/$d" 2>/dev/null || true
+    for dev in ${D_PARTES[$d]:-}; do sudo wipefs -a -q "/dev/$dev" 2>/dev/null || true; done
+    sudo wipefs -a -q "/dev/$d" || { ui_error "wipefs fallo: el disco rechaza escrituras."; return 1; }
+    if [[ $esq == MBR ]]; then tabla=$(printf 'label: dos\n,,%s\n' "$(tipo_mbr "$fs")")
+    else tabla=$(printf 'label: gpt\n,,%s\n' "$(tipo_gpt "$fs")"); fi
+    printf '%s\n' "$tabla" | sudo sfdisk --quiet --wipe always --wipe-partitions always "/dev/$d" \
+        || { ui_error "No se pudo escribir la tabla de particiones."; return 1; }
+    sudo blockdev --rereadpt "/dev/$d" 2>/dev/null || true
+    dev=$(nombre_particion "$d" 1)
+    esperar_dispositivo "$dev" || { ui_error "El sistema no registro $dev. Desconecta y vuelve a conectar."; return 1; }
+    desmontar_particion "$dev" || return 1          # por si algo la automonto
+    crear_fs "$dev" "$fs" "$etq" || { ui_error "Fallo el formateo de $dev."; return 1; }
+    udevadm settle 2>/dev/null
+    registrar "REPARAR /dev/$d $esq $fs '$etq' ($huella)"
+    ui_ok "Listo: /dev/$d reparado."
+    lsblk -o NAME,SIZE,FSTYPE,LABEL -- "/dev/$d"
+}
+
+# ================================================================
+#  EXPULSAR
+# ================================================================
+op_expulsar() {
+    local d=$1
+    desmontar_disco "$d" || return 1
+    sync
+    if command -v udisksctl >/dev/null 2>&1 && udisksctl power-off -b "/dev/$d" 2>/dev/null; then
+        :
+    else
+        pedir_sudo || return 1
+        printf '1' | sudo tee "/sys/block/$d/device/delete" >/dev/null || { ui_error "No se pudo expulsar."; return 1; }
+    fi
+    registrar "EXPULSAR /dev/$d"
+    ui_ok "Listo: ya puedes desconectar /dev/$d."
+}
+
+# ================================================================
+#  PROTEGER / DESPROTEGER / EXIMIR / REACTIVAR  (no tocan el disco)
+# ================================================================
+op_proteccion() {
+    local d=$1 serie est op
+    serie=${D_SERIE[$d]:-}
+    est=$(estado_proteccion "$d")
+    case $est in
+        nucleo)   ui_info "Bloqueo del nivel 1: no hay nada que quitar ni que agregar."; return 0 ;;
+        sinserie) ui_info "Este disco no reporta numero de serie: no se puede recordar."; return 0 ;;
+        protegido) op=$(ui_elegir "Protegido por ti" "DESPROTEGER   quitar mi proteccion") ;;
+        exento)    op=$(ui_elegir "Exento de heuristicas" "REACTIVAR     volver a aplicarle las heuristicas" "PROTEGER      bloquear toda escritura, siempre") ;;
+        bloqueado) op=$(ui_elegir "Bloqueado por heuristicas" "EXIMIR        liberarlo de modelo, etiqueta y tamano" "PROTEGER      bloquear toda escritura, siempre") ;;
+        libre)     op=$(ui_elegir "Libre" "PROTEGER      bloquear toda escritura, siempre") ;;
+    esac || return 1
+    op=${op%% *}
+    cambiar_proteccion "$serie" "${op,,}" || return 1
+    cargar_preferencias
+    registrar "$op serie=$serie"
+    ui_ok "$op guardado para la serie $serie."
+}
+
+# ================================================================
+#  AYUDANTE CON PERMISOS  (sudo limpiador-usb --interno ...)
+#  Una sola llamada a sudo por prueba, en vez de cientos de 'sudo dd'
+#  llenando el journal. Todo aqui es de SOLO LECTURA.
+# ================================================================
+# Lee COUNT bloques de BS bytes desde el bloque SKIP con O_DIRECT, para
+# medir el medio y no la cache. Imprime segundos segun dd, o ERR.
+leer_bloques() {
+    local out
+    out=$(LC_ALL=C dd if="$1" of=/dev/null bs="$2" skip="$3" count="$4" \
+          iflag=direct,fullblock 2>&1) || { echo ERR; return 1; }
+    [[ $out =~ copied,\ ([0-9.eE+-]+)\ s ]] && { echo "${BASH_REMATCH[1]}"; return 0; }
+    echo ERR; return 1
+}
+
+aleatorio64() { echo $(( (RANDOM << 45) ^ (RANDOM << 30) ^ (RANDOM << 15) ^ RANDOM )); }
+
+interno_acceso() {     # DEV N  -> N latencias en ms
+    local dev=$1 n=$2 tam bloques i s
+    tam=$(blockdev --getsize64 "$dev") || exit 1
+    bloques=$(( tam / 4096 ))
+    for (( i = 0; i < n; i++ )); do
+        s=$(leer_bloques "$dev" 4096 $(( $(aleatorio64) % bloques )) 1)
+        [[ $s == ERR ]] && echo ERR || LC_ALL=C awk -v s="$s" 'BEGIN{printf "%.3f\n", s*1000}'
+    done
+}
+
+# DEV BLOQUE DESDE HASTA CELDAS MODO  -> por celda: "i ms_por_bloque ok|err N"
+interno_superficie() {
+    local dev=$1 bs=$2 desde=$3 hasta=$4 celdas=$5 modo=$6
+    local nb primero ultimo total por i ini cuantos s k seguidos=0 malos
+    nb=$(( $(blockdev --getsize64 "$dev") / bs ))
+    primero=$(( nb * desde / 100 )); ultimo=$(( nb * hasta / 100 ))
+    total=$(( ultimo - primero )); (( total < 1 )) && exit 1
+    (( celdas > total )) && celdas=$total
+    por=$(( total / celdas ))
+    for (( i = 0; i < celdas; i++ )); do
+        ini=$(( primero + i * por ))
+        if [[ $modo == muestreo ]]; then cuantos=1
+        else cuantos=$por; (( i == celdas - 1 )) && cuantos=$(( ultimo - ini )); fi
+        s=$(leer_bloques "$dev" "$bs" "$ini" "$cuantos")
+        if [[ $s != ERR ]]; then
+            seguidos=0
+            LC_ALL=C awk -v s="$s" -v n="$cuantos" -v i="$i" 'BEGIN{printf "%d %.3f ok 0\n", i, s*1000/n}'
+            continue
+        fi
+        # Celda con error: se baja bloque a bloque para contar cuantos.
+        malos=1
+        if (( cuantos > 1 )); then
+            malos=0
+            for (( k = 0; k < cuantos; k++ )); do
+                [[ $(leer_bloques "$dev" "$bs" $(( ini + k )) 1) == ERR ]] && ((malos++))
+                # Tope: en un disco moribundo cada lectura fallida tarda segundos.
+                (( malos >= 16 )) && break
+            done
+        fi
+        echo "$i 0 err $malos"
+        # Tras 12 fallos seguidos: ¿sigue existiendo el disco, o se colgo
+        # el adaptador? Sin esto el mapa se llenaria de errores falsos.
+        if (( ++seguidos >= 12 )) && [[ ! -b $dev || ! -e /sys/class/block/${dev#/dev/} ]]; then
+            echo "DESAPARECIO"; exit 3
+        fi
+    done
+}
+
+# ================================================================
+#  DIAGNOSTICO  (solo lectura: se ofrece incluso en discos blindados)
+# ================================================================
+diag_pasaporte() {
+    local d=$1 fw rota
+    fw=$(cat "/sys/block/$d/device/rev" 2>/dev/null || true)
+    case ${D_ROTA[$d]:-} in 1) rota="HDD (rotacional)";; 0) rota="SSD / flash";; *) rota="?";; esac
+    ui_titulo "PASAPORTE /dev/$d"
+    printf '  %-16s %s\n' \
+        modelo "$(nombre_visible "$d")" serie "${D_SERIE[$d]:-(no reporta)}" \
+        firmware "${fw:-?}" wwn "${D_WWN[$d]:-?}" \
+        "tipo (dice)" "$rota" bus "${D_TRAN[$d]:-?}" \
+        capacidad "$(formato_tam "${D_TAM[$d]}")  (${D_TAM[$d]} bytes)" \
+        "sector log/fis" "${D_LOGSEC[$d]:-?} / ${D_PHYSEC[$d]:-?}" \
+        particiones "${D_PTTYPE[$d]:-ninguna}" \
+        extraible "$([[ ${D_RM[$d]:-0} == 1 ]] && echo si || echo no)"
+    if [[ -n ${SIS_RAZON[$d]:-} ]]; then
+        printf '  %-16s %s\n' sistema "$(tr '\n' ';' <<< "${SIS_RAZON[$d]}")"
+    fi
+    ui_info "  Los puentes USB mienten: un JMicron reporta su propio nombre y series de relleno."
+    ui_info "  'T. DE ACCESO' mide el hardware real en vez de creerle."
+}
+
+diag_smart() {
+    local d=$1 out rc
+    necesitar smartctl || return 1
+    pedir_sudo || return 1
+    out=$(sudo smartctl -H -i -A "/dev/$d" 2>&1); rc=$?
+    if (( rc & 2 )) || grep -qiE 'unknown usb bridge|please specify device type' <<< "$out"; then
+        out=$(sudo smartctl -H -i -A -d sat "/dev/$d" 2>&1); rc=$?
+    fi
+    ui_titulo "SALUD S.M.A.R.T. /dev/$d"
+    if (( rc & 2 )); then
+        ui_error "  El disco (o su adaptador USB) no deja leer S.M.A.R.T."
+        ui_info  "  Normal en memorias USB y en carcasas baratas. El test de superficie sigue sirviendo."
+        return 0
+    fi
+    printf '%s\n' "$out" | sed -n '/=== START OF READ SMART DATA/,$p'
+    awk '$1 ~ /^(5|187|197|198|199)$/ && $NF+0 > 0 {m=1; printf "  ! %s = %s\n", $2, $NF}
+         END { exit m ? 0 : 1 }' <<< "$out" \
+        && ui_error "  Hay sectores reasignados, pendientes o errores: el disco se esta degradando." \
+        || ui_ok "  Sin sectores reasignados ni pendientes."
+}
+
+diag_acceso() {
+    local d=$1 mediana
+    pedir_sudo || return 1
+    ui_titulo "T. DE ACCESO /dev/$d"
+    ui_info "  300 lecturas de 4 KB en posiciones aleatorias, sin cache..."
+    mediana=$(sudo bash "$SELF" --interno acceso "/dev/$d" 300 | grep -v ERR | sort -n |
+              awk '{v[NR]=$1} END{ if (NR) print (NR%2 ? v[(NR+1)/2] : (v[NR/2]+v[NR/2+1])/2) }')
+    [[ -n $mediana ]] || { ui_error "  No hubo lecturas validas."; return 1; }
+    printf '  mediana: %s ms\n  veredicto: ' "$mediana"
+    veredicto_acceso "$mediana"
+}
+
+veredicto_acceso() {   # < 3 ms electronico, 3-8 no concluyente, >= 8 mecanico
+    LC_ALL=C awk -v m="$1" 'BEGIN{
+        if (m < 3)      print "ELECTRONICO (SSD o memoria flash)"
+        else if (m < 8) print "NO CONCLUYENTE"
+        else            print "MECANICO (disco con platos: el cabezal se mueve en cada salto)" }'
+}
+
+# Umbrales de Victoria para bloques de 128 KB, escalados con el bloque:
+# sin escalar, el mismo disco saldria "dorado" con 1 MB y "rojo" con 8 MB.
+umbrales() {           # umbrales BLOQUE_BYTES -> 5 umbrales en ms
+    LC_ALL=C awk -v b="$1" 'BEGIN{ f = b/131072; if (f < 1) f = 1
+        printf "%g %g %g %g %g\n", 5*f, 20*f, 50*f, 200*f, 600*f }'
+}
+
+franja() {             # franja MS "u1 u2 u3 u4 u5" -> 0..5
+    LC_ALL=C awk -v m="$1" -v u="$2" 'BEGIN{ split(u, t, " ")
+        for (i = 1; i <= 5; i++) if (m < t[i]) { print i-1; exit }
+        print 5 }'
+}
+
+readonly COLOR_FRANJA=(34 118 220 208 196 88)   # verde lima oro naranja rojo rojo-oscuro
+readonly COLOR_ERROR=51                          # cian
+
+diag_superficie() {
+    local d=$1 modo=$2 desde=0 hasta=100 bs=1048576 op u celdas=1536 col=0
+    local i ms est malos f cont=(0 0 0 0 0 0) errs=0 bloques_malos=0 t0 t1
+    local -a uu
+    if [[ $modo == completo ]]; then
+        desde=$(ui_pedir "DESDE %:" 0) || return 1
+        hasta=$(ui_pedir "HASTA %:" 100) || return 1
+        [[ $desde =~ ^[0-9]{1,3}$ && $hasta =~ ^[0-9]{1,3}$ ]] || { ui_error "Rango invalido."; return 1; }
+        desde=$((10#$desde)); hasta=$((10#$hasta))
+        (( desde < hasta && hasta <= 100 )) || { ui_error "Rango invalido."; return 1; }
+    fi
+    op=$(ui_elegir "Tamano de bloque (1 MB es el equilibrio)" "1 MB" "256 KB" "4 MB" "8 MB") || return 1
+    case $op in "256 KB") bs=262144;; "1 MB") bs=1048576;; "4 MB") bs=4194304;; "8 MB") bs=8388608;; esac
+    u=$(umbrales "$bs")
+    pedir_sudo || return 1
+    ui_titulo "SUPERFICIE ${modo^^} /dev/$d  ($desde%-$hasta%, bloque $(formato_tam "$bs"))"
+    [[ $modo == completo ]] && ui_info "  Va a la velocidad del medio. Ctrl+C para detener."
+    printf '  '
+    t0=$(date +%s)
+    while read -r i ms est malos; do
+        if [[ $i == DESAPARECIO ]]; then
+            printf '\n'; ui_error "  El disco dejo de responder y el sistema lo quito."
+            ui_info  "  Suele ser el adaptador USB colgado, no el disco. Desconecta, espera y reconecta,"
+            ui_info  "  mejor en un puerto directo, y revisa por tramos con DESDE% / HASTA%."
+            break
+        fi
+        if [[ $est == err ]]; then
+            ((errs++)); bloques_malos=$(( bloques_malos + malos ))
+            printf '\e[38;5;%sm█\e[0m' "$COLOR_ERROR"
+        else
+            f=$(franja "$ms" "$u"); ((cont[f]++))
+            printf '\e[38;5;%sm█\e[0m' "${COLOR_FRANJA[f]}"
+        fi
+        (( ++col % 64 == 0 )) && printf '\n  '
+    done < <(sudo bash "$SELF" --interno superficie "/dev/$d" "$bs" "$desde" "$hasta" "$celdas" "$modo")
+    t1=$(date +%s)
+    read -r -a uu <<< "$u"
+    printf '\n\n  %s' "$(printf '\e[38;5;%sm█\e[0m <%sms %s   ' \
+        "${COLOR_FRANJA[0]}" "${uu[0]}" "${cont[0]}" "${COLOR_FRANJA[1]}" "${uu[1]}" "${cont[1]}" \
+        "${COLOR_FRANJA[2]}" "${uu[2]}" "${cont[2]}" "${COLOR_FRANJA[3]}" "${uu[3]}" "${cont[3]}" \
+        "${COLOR_FRANJA[4]}" "${uu[4]}" "${cont[4]}")"
+    printf '\e[38;5;%sm█\e[0m >%sms %s   \e[38;5;%sm█\e[0m error %s\n' \
+        "${COLOR_FRANJA[5]}" "${uu[4]}" "${cont[5]}" "$COLOR_ERROR" "$errs"
+    printf '  celdas: %s  |  bloques ilegibles: %s  |  %s s\n' "$col" "$bloques_malos" "$(( t1 - t0 ))"
+    [[ $modo == completo ]] && ui_info "  En COMPLETO cada celda muestra el tiempo MEDIO por bloque de su tramo."
+    [[ $modo == muestreo ]] && ui_info "  MUESTREO ve zonas lentas y danos extensos, pero puede saltarse un sector malo suelto."
+    if (( errs > 0 )); then
+        ui_error "  Hay zonas ilegibles. Un disco que no puede releer lo que tiene ya no es de fiar."
+    fi
+    registrar "SUPERFICIE $modo /dev/$d $desde-$hasta% bs=$bs errores=$errs malos=$bloques_malos"
+}
+
+op_diagnostico() {
+    local d=$1 op
+    while true; do
+        op=$(ui_elegir "DIAGNOSTICO /dev/$d  -  solo lectura" \
+            "PASAPORTE" "SALUD S.M.A.R.T." "T. DE ACCESO          ¿mecanico o electronico?" \
+            "SUPERFICIE: MUESTREO  1536 lecturas repartidas, rapido" \
+            "SUPERFICIE: COMPLETO  todo el rango, a la velocidad del medio" \
+            "VOLVER") || return 0
+        case $op in
+            PASAPORTE*)     diag_pasaporte "$d" ;;
+            SALUD*)         diag_smart "$d" ;;
+            "T. DE"*)       diag_acceso "$d" ;;
+            *MUESTREO*)     diag_superficie "$d" muestreo ;;
+            *COMPLETO*)     diag_superficie "$d" completo ;;
+            *)              return 0 ;;
+        esac
+        ui_pausa
+    done
+}
+
+# ================================================================
+#  GRABAR  -- imagen byte a byte sobre el disco (como Etcher)
+# ================================================================
+comprimida()         { case ${1,,} in *.xz|*.gz|*.zst|*.zip) return 0;; esac; return 1; }
+herramienta_imagen() { case ${1,,} in *.xz) echo xz;; *.gz) echo gzip;; *.zst) echo zstd;; *.zip) echo unzip;; esac; }
+
+entrada_zip() {        # la imagen dentro del zip
+    local e
+    e=$(unzip -Z1 -- "$1" 2>/dev/null | grep -iE '\.(iso|img|raw|bin)$' | head -n1)
+    [[ -n $e ]] || e=$(unzip -Z1 -- "$1" 2>/dev/null | head -n1)
+    printf '%s' "$e"
+}
+
+flujo_imagen() {       # la imagen, descomprimida, por stdout
+    local f=$1
+    case ${f,,} in
+        *.xz)  xz -dc -- "$f" ;;
+        *.gz)  gzip -dc -- "$f" ;;
+        *.zst) zstd -dcq -- "$f" ;;
+        *.zip) unzip -p -- "$f" "$(entrada_zip "$f")" ;;
+        *)     cat -- "$f" ;;
+    esac
+}
+
+tam_imagen() {         # bytes descomprimidos, o vacio si no se sabe
+    local f=$1
+    case ${f,,} in
+        *.xz)  xz --robot --list -- "$f" 2>/dev/null | awk '$1 == "totals" {print $5}' ;;
+        *.zip) unzip -l -- "$f" "$(entrada_zip "$f")" 2>/dev/null | tail -n1 | awk '{print $1}' ;;
+        *.gz|*.zst) ;;
+        *)     stat -c %s -- "$f" 2>/dev/null ;;
+    esac
+}
+
+algoritmo_hash() {     # se deduce de la longitud
+    case ${#1} in 32) echo md5sum;; 40) echo sha1sum;; 64) echo sha256sum;; *) return 1;; esac
+}
+
+# Los ISO de instalacion de Windows no llevan 0x55AA en los bytes
+# 510-511 y no arrancan grabados en crudo. Se avisa, no se bloquea.
+firma_arranque() {
+    flujo_imagen "$1" 2>/dev/null | head -c 512 | tail -c 2 | od -An -tx1 | tr -d ' \n'
+}
+
+elegir_imagen() {
+    local op ruta
+    local -a cand=()
+    mapfile -t cand < <(find "$HOME" -maxdepth 3 -type f -not -path '*/.*' -size +1M \
+        \( -iname '*.iso' -o -iname '*.img' -o -iname '*.raw' -o -iname '*.img.xz' \
+           -o -iname '*.iso.xz' -o -iname '*.img.gz' -o -iname '*.img.zst' \
+           -o \( -iname '*.zip' -size +50M \) \) 2>/dev/null | sort | head -n 40)
+    op=$(ui_elegir "Imagen a grabar" "${cand[@]}" "OTRA RUTA...") || return 1
+    if [[ $op == "OTRA RUTA..." ]]; then
+        ruta=$(ui_pedir "Ruta de la imagen:" "$HOME/") || return 1
+        ruta=${ruta/#\~/$HOME}
+    else
+        ruta=$op
+    fi
+    printf '%s' "$ruta"
+}
+
+leer_disco_crudo() {   # DISCO BYTES -> los primeros BYTES del disco, sin cache
+    local d=$1 bytes=$2 alin=${D_LOGSEC[$1]:-512}
+    (( alin < 512 )) && alin=512
+    if (( bytes % alin == 0 )); then
+        sudo dd if="/dev/$d" bs=4M iflag=direct,count_bytes count="$bytes" status=none
+    else
+        sudo dd if="/dev/$d" bs=4M iflag=count_bytes count="$bytes" status=none
+    fi
+}
+
+op_grabar() {
+    local d=$1 huella img tam hash alg calc op verificar=1 tmp rc bytes cmpout
+    huella=$(huella_guardada "$d")
+    img=$(elegir_imagen) || return 1
+    [[ -f $img && -r $img ]] || { ui_error "No existe o no se puede leer: $img"; return 1; }
+    if comprimida "$img"; then necesitar "$(herramienta_imagen "$img")" || return 1; fi
+    if discos_de_ruta "$img" | grep -qx -- "$d"; then
+        ui_error "BLOQUEADO: la imagen esta DENTRO del disco que vas a sobrescribir."
+        return 1
+    fi
+    tam=$(tam_imagen "$img")
+    if [[ $tam =~ ^[0-9]+$ ]] && (( tam > ${D_TAM[$d]} )); then
+        ui_error "La imagen ($(formato_tam "$tam")) no cabe en el disco ($(formato_tam "${D_TAM[$d]}"))."
+        return 1
+    fi
+    hash=$(ui_pedir "Hash que publica la distro (SHA256, SHA1 o MD5). Vacio para omitir:") || return 1
+    hash=$(recortar "$hash"); hash=${hash,,}
+    if [[ -n $hash ]]; then
+        if ! alg=$(algoritmo_hash "$hash") || [[ ! $hash =~ ^[0-9a-f]+$ ]]; then
+            ui_error "Eso no parece un SHA256 (64), SHA1 (40) ni MD5 (32)."; return 1
+        fi
+        ui_info "Comprobando la imagen con $alg ANTES de tocar el disco..."
+        calc=$("$alg" -- "$img" | awk '{print $1}')
+        if [[ $calc != "$hash" ]]; then
+            ui_error "EL HASH NO COINCIDE. No se escribio nada."
+            printf '  esperado  %s\n  imagen    %s\n' "$hash" "$calc"
+            return 1
+        fi
+        ui_ok "Hash correcto."
+    fi
+    if [[ $(firma_arranque "$img") != 55aa ]]; then
+        ui_error "Aviso: el primer sector no tiene la firma de arranque 0x55AA."
+        ui_info  "Pasa con los ISO de instalacion de Windows: grabados byte a byte NO arrancan"
+        ui_info  "(necesitan Rufus o WoeUSB). Las imagenes de Linux si arrancan."
+        ui_confirmar "¿Grabarla de todos modos?" || return 1
+    fi
+    op=$(ui_elegir "Al terminar" "VERIFICAR      releer y comparar byte a byte (recomendado)" "NO VERIFICAR") || return 1
+    [[ $op == NO* ]] && verificar=0
+
+    ui_titulo "GRABAR sobre /dev/$d"
+    printf '  imagen   %s\n  tamano   %s\n  disco    /dev/%s  %s  serie %s\n' \
+        "$img" "$( [[ -n $tam ]] && formato_tam "$tam" || echo 'se sabra al terminar')" \
+        "$d" "$(nombre_visible "$d")" "${D_SERIE[$d]:-(no reporta)}"
+    ui_error "  Se sobrescribe TODO el disco."
+    ui_escribir_para_confirmar "DISCO $d" || { ui_info "Cancelado."; return 1; }
+    pedir_sudo || return 1
+    desmontar_disco "$d" || return 1
+    verificar_antes_de_escribir "$d" "$huella" || return 1
+
+    tmp=$(mktemp)
+    ui_info "Grabando. Ctrl+C cancela, pero el disco quedaria a medio grabar."
+    if comprimida "$img"; then
+        flujo_imagen "$img" | sudo env LC_ALL=C dd of="/dev/$d" bs=4M iflag=fullblock \
+            oflag=direct conv=fsync status=progress 2> >(tee "$tmp" >&2)
+        rc=$(( PIPESTATUS[0] | PIPESTATUS[1] ))
+    else
+        sudo env LC_ALL=C dd if="$img" of="/dev/$d" bs=4M oflag=direct conv=fsync \
+            status=progress 2> >(tee "$tmp" >&2)
+        rc=$?
+    fi
+    wait "$!" 2>/dev/null
+    ui_info "Vaciando lo pendiente al dispositivo..."
+    sync
+    bytes=$(tr '\r' '\n' < "$tmp" | grep -oE '^[0-9]+ bytes' | tail -n1 | cut -d' ' -f1)
+    if (( rc != 0 )) || [[ -z $bytes ]]; then
+        ui_error "La grabacion fallo."; tr '\r' '\n' < "$tmp" | tail -n3; rm -f -- "$tmp"
+        registrar "GRABAR FALLO /dev/$d '$img' ($huella)"
+        return 1
+    fi
+    rm -f -- "$tmp"
+
+    if (( verificar )); then
+        # La leccion del disco H: sin saltarse la cache, la relectura puede
+        # venir de la RAM y "verificar" algo que el disco nunca guardo.
+        ui_info "Verificando: releyendo $(formato_tam "$bytes") del disco, sin cache..."
+        sudo blockdev --flushbufs "/dev/$d" 2>/dev/null || true
+        cmpout=$(cmp -- <(flujo_imagen "$img" 2>/dev/null) <(leer_disco_crudo "$d" "$bytes") 2>&1); rc=$?
+        if (( rc == 0 )); then
+            ui_ok "VERIFICADO: identico byte a byte ($(formato_tam "$bytes"))."
+        else
+            ui_error "LA VERIFICACION FALLO: $cmpout"
+            ui_error "El disco acepto la escritura y devuelve otros datos: no es de fiar."
+        fi
+    fi
+    sudo blockdev --rereadpt "/dev/$d" 2>/dev/null || true
+    udevadm settle 2>/dev/null
+    registrar "GRABAR /dev/$d '$img' bytes=$bytes verificado=$verificar rc=$rc ($huella)"
+}
+
+# ================================================================
+#  RECUPERAR  -- PhotoRec, con el guardian del destino
+# ================================================================
+op_recuperar() {
+    local d=$1 dest n
+    necesitar photorec || return 1
+    dest=$(ui_pedir "Carpeta para lo recuperado (en OTRO disco):" "$HOME/Recuperados/${d}-$(date +%Y%m%d-%H%M)") || return 1
+    dest=${dest/#\~/$HOME}
+    mkdir -p -- "$dest" || { ui_error "No se pudo crear $dest"; return 1; }
+    # No es un aviso: es un bloqueo.
+    if discos_de_ruta "$dest" | grep -qx -- "$d"; then
+        ui_error "BLOQUEADO: $dest esta en el mismo disco del que quieres recuperar."
+        ui_info  "Cada archivo que escribas ahi puede machacar justo lo que aun no rescataste."
+        return 1
+    fi
+    ui_titulo "RECUPERAR desde /dev/$d  ->  $dest"
+    ui_info "PhotoRec abre su propia pantalla. El disco de origen solo se LEE."
+    printf '  1. Elige la particion, o "Whole disk" si esta formateado o sin tabla.\n'
+    printf '  2. Sistema de archivos: [Other] para FAT/exFAT/NTFS, [ext2/ext3] para Linux.\n'
+    printf '  3. [Whole] busca en todo (tras formatear); [Free] solo en lo borrado.\n'
+    printf '  4. Si te muestra la carpeta de destino, ya viene puesta: confirmala con C.\n'
+    printf '     %sNo elijas otra carpeta dentro de PhotoRec.%s\n' "$C_ROJO" "$C_RST"
+    ui_confirmar "¿Abrir PhotoRec?" || return 1
+    pedir_sudo || return 1
+    ( cd -- "$dest" && sudo photorec /log /d "$dest/rescate" "/dev/$d" )
+    sudo chown -R "$(id -u):$(id -g)" -- "$dest" 2>/dev/null || true
+    n=$(find "$dest" -type f ! -name 'photorec.*' 2>/dev/null | wc -l)
+    registrar "RECUPERAR /dev/$d -> $dest archivos=$n"
+    ui_ok "Archivos rescatados: $n en $dest"
+    ui_info "Salen sin sus nombres originales: esa informacion vivia en la tabla que se borro."
+}
+
+# ================================================================
+#  MENUS
+# ================================================================
+VER_TODOS=0
+
+discos_visibles() {    # extraibles; con VER_TODOS tambien los internos
+    local d
+    for d in "${DISCOS[@]}"; do
+        (( VER_TODOS )) || bus_extraible "$d" || continue
+        printf '%s\n' "$d"
+    done
+}
+
+menu_disco() {
+    local d=$1 op p rz nucleo
+    local -a ops
+    while true; do
+        leer_discos; cargar_preferencias
+        [[ -n ${D_TAM[$d]:-} ]] || { ui_error "/dev/$d ya no esta conectado."; ui_pausa; return; }
+        ui_banner
+        mostrar_tarjeta "$d"
+        rz=$(razones_bloqueo "$d"); nucleo=$(razones_bloqueo "$d" nucleo)
+        ops=()
+        if [[ -z $rz ]]; then
+            for p in ${D_PARTES[$d]:-}; do
+                [[ -n ${P_FSTYPE[$p]:-} ]] && ops+=("LIMPIAR     /dev/$p  ${P_ETIQ[$p]:-}")
+            done
+            for p in ${D_PARTES[$d]:-}; do ops+=("FORMATEAR   /dev/$p"); done
+            ops+=("REPARAR     disco completo: tabla nueva + formato"
+                  "GRABAR      imagen .iso / .img byte a byte")
+        fi
+        [[ -z $nucleo ]] && ops+=("EXPULSAR")
+        # Solo lectura: tambien en discos blindados, que es donde mas importa.
+        ops+=("DIAGNOSTICO" "RECUPERAR   archivos borrados o formateados")
+        [[ -z $nucleo ]] && ops+=("PROTECCION  proteger / eximir este disco")
+        ops+=("VOLVER")
+        op=$(ui_elegir "/dev/$d  -  que hacer" "${ops[@]}") || return
+        case $op in
+            LIMPIAR*)     p=$(awk '{print $2}' <<< "$op"); op_limpiar "${p#/dev/}" ;;
+            FORMATEAR*)   p=$(awk '{print $2}' <<< "$op"); op_formatear "${p#/dev/}" ;;
+            REPARAR*)     op_reparar "$d" ;;
+            GRABAR*)      op_grabar "$d" ;;
+            EXPULSAR*)    op_expulsar "$d" && { ui_pausa; return; } ;;
+            DIAGNOSTICO*) op_diagnostico "$d"; continue ;;
+            RECUPERAR*)   op_recuperar "$d" ;;
+            PROTECCION*)  op_proteccion "$d" ;;
+            *)            return ;;
+        esac
+        ui_pausa
+    done
+}
+
+menu_principal() {
+    local op d hay_blindada
+    local -a ids lineas bl libres
+    trap 'printf "\n"' INT     # Ctrl+C corta la operacion en curso, no el programa
+    while true; do
+        reiniciar_reglas; cargar_config; cargar_preferencias; leer_discos
+        ui_banner
+        mapfile -t ids < <(discos_visibles)
+        bl=(); libres=(); hay_blindada=0
+        # Las blindadas primero, como en Windows.
+        for d in "${ids[@]}"; do
+            if [[ -n $(razones_bloqueo "$d") ]]; then bl+=("$d")
+                [[ -z $(razones_bloqueo "$d" nucleo) ]] && hay_blindada=1
+            else libres+=("$d"); fi
+        done
+        (( hay_blindada )) && printf '  %s/// UNIDAD BLINDADA CONECTADA ///%s\n' "$C_ROJO" "$C_RST"
+        lineas=()
+        for d in "${bl[@]}" "${libres[@]}"; do lineas+=("$(linea_disco "$d")"); done
+        (( ${#lineas[@]} )) || ui_info "  No hay memorias USB ni tarjetas conectadas."
+        if (( VER_TODOS )); then lineas+=("·· SOLO MEDIOS EXTRAIBLES")
+        else lineas+=("·· VER TODOS LOS DISCOS (internos: solo diagnostico)"); fi
+        lineas+=("·· ACTUALIZAR" "·· AUTOPRUEBA DEL GUARDIAN" "·· REGISTRO" "·· SALIR")
+        op=$(ui_elegir "Unidades  (serie = identidad, no /dev/sdX)" "${lineas[@]}") || exit 0
+        case $op in
+            "·· VER TODOS"*)  VER_TODOS=1 ;;
+            "·· SOLO"*)       VER_TODOS=0 ;;
+            "·· ACTUALIZAR")  ;;
+            "·· AUTOPRUEBA"*) autoprueba; ui_pausa ;;
+            "·· REGISTRO")    ui_titulo "REGISTRO ($LOG_FILE)"
+                              tail -n 40 -- "$LOG_FILE" 2>/dev/null || ui_info "  (vacio)"; ui_pausa ;;
+            "·· SALIR")       exit 0 ;;
+            *)                menu_disco "${op%% *}" ;;
+        esac
+    done
+}
+
+# Desde el lanzador de Omarchy no hay terminal: se abre una.
+abrir_en_terminal() {
+    [[ -t 0 && -t 1 ]] && return 0
+    local t
+    command -v xdg-terminal-exec >/dev/null 2>&1 && exec xdg-terminal-exec bash "$SELF"
+    for t in "${TERMINAL:-}" alacritty ghostty kitty foot wezterm konsole gnome-terminal xterm; do
+        [[ -n $t ]] && command -v "$t" >/dev/null 2>&1 || continue
+        case $t in
+            gnome-terminal) exec "$t" -- bash "$SELF" ;;
+            wezterm)        exec "$t" start -- bash "$SELF" ;;
+            *)              exec "$t" -e bash "$SELF" ;;
+        esac
+    done
+    command -v notify-send >/dev/null 2>&1 && notify-send "Limpiador de USB" "No encontre una terminal para abrirlo."
+    exit 1
+}
+
+ayuda() {
+    cat <<EOF
+Limpiador de USB $VERSION - version Linux / Omarchy
+
+  limpiador-usb              abre el menu
+  limpiador-usb --ventana    igual, pero abre una terminal si hace falta (lanzador)
+  limpiador-usb --autoprueba comprueba el guardian sin tocar ningun disco
+  limpiador-usb --version
+
+Configuracion:  $CONF_FILE
+Preferencias:   $PREF_FILE
+Registro:       $LOG_FILE
+EOF
+}
+
+main() {
+    case ${1:-} in
+        --interno)
+            # Solo lo invoca el propio programa via sudo, y solo lee.
+            (( EUID == 0 )) || { echo "--interno es de uso interno (via sudo)" >&2; exit 1; }
+            [[ ${3:-} == /dev/* && -b ${3:-} ]] || exit 2
+            case ${2:-} in
+                acceso)
+                    [[ ${4:-} =~ ^[0-9]+$ ]] || exit 2
+                    interno_acceso "$3" "$4" ;;
+                superficie)
+                    [[ ${4:-} =~ ^[0-9]+$ && ${5:-} =~ ^[0-9]+$ && ${6:-} =~ ^[0-9]+$ \
+                       && ${7:-} =~ ^[0-9]+$ && ${8:-} =~ ^(muestreo|completo)$ ]] || exit 2
+                    interno_superficie "$3" "$4" "$5" "$6" "$7" "$8" ;;
+                *) exit 2 ;;
+            esac
+            exit ;;
+        --autoprueba) autoprueba; exit $? ;;
+        --version)    echo "$VERSION"; exit 0 ;;
+        -h|--help)    ayuda; exit 0 ;;
+        --ventana)    abrir_en_terminal ;;
+        "") ;;
+        *) ayuda; exit 2 ;;
+    esac
+    [[ $(uname -s) == Linux ]] || { echo "Esta es la version para Linux. En Windows usa Limpiador-USB.ps1." >&2; exit 1; }
+    for c in lsblk findmnt; do
+        command -v "$c" >/dev/null 2>&1 || { echo "Falta $c (paquete util-linux)." >&2; exit 1; }
+    done
+    menu_principal
+}
+
+# ================================================================
+#  AUTOPRUEBA  -- el guardian contra discos simulados. No toca nada.
+# ================================================================
+AP_OK=0; AP_FALLO=0
+comprobar() {          # comprobar "descripcion" comando...
+    local desc=$1; shift
+    if "$@" >/dev/null 2>&1; then
+        ((AP_OK++)); printf '  %sOK%s     %s\n' "$C_VERDE" "$C_RST" "$desc"
+    else
+        ((AP_FALLO++)); printf '  %sFALLO%s  %s\n' "$C_ROJO" "$C_RST" "$desc"
+    fi
+}
+bloqueado()     { [[ -n $(razones_bloqueo "$1") ]]; }
+operable()      { [[ -z $(razones_bloqueo "$1") ]]; }
+es_nucleo()     { [[ -n $(razones_bloqueo "$1" nucleo) ]]; }
+razon_incluye() { razones_bloqueo "$1" | grep -qF -- "$2"; }
+n_razones()     { razones_bloqueo "$1" | grep -c .; }
+al_menos()      { (( $(n_razones "$1") >= $2 )); }
+igual()         { [[ $1 == "$2" ]]; }
+contiene()      { [[ $1 == *"$2"* ]]; }
+
+AP_FIXTURE='NAME="/dev/nvme0n1" PKNAME="" TYPE="disk" TRAN="nvme" RM="0" SIZE="2048408248320" MODEL="KINGSTON SKC3000D2048G" SERIAL="SERIE-SISTEMA" VENDOR="" RO="0" ROTA="0" PTTYPE="gpt" WWN="eui.0026b768" FSTYPE="" LABEL="" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/nvme0n1p1" PKNAME="/dev/nvme0n1" TYPE="part" TRAN="" RM="0" SIZE="2147483648" MODEL="" SERIAL="" VENDOR="" RO="0" ROTA="0" PTTYPE="gpt" WWN="" FSTYPE="vfat" LABEL="" MOUNTPOINT="/boot" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/nvme0n1p2" PKNAME="/dev/nvme0n1" TYPE="part" TRAN="" RM="0" SIZE="2046260764672" MODEL="" SERIAL="" VENDOR="" RO="0" ROTA="0" PTTYPE="gpt" WWN="" FSTYPE="crypto_LUKS" LABEL="" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/mapper/root" PKNAME="/dev/nvme0n1p2" TYPE="crypt" TRAN="" RM="0" SIZE="2046244000000" MODEL="" SERIAL="" VENDOR="" RO="0" ROTA="0" PTTYPE="" WWN="" FSTYPE="btrfs" LABEL="" MOUNTPOINT="/" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/sdb" PKNAME="" TYPE="disk" TRAN="usb" RM="1" SIZE="16008609792" MODEL="Cruzer Fit" SERIAL="USB-PRUEBA-1" VENDOR="SanDisk " RO="0" ROTA="0" PTTYPE="dos" WWN="" FSTYPE="" LABEL="" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/sdb1" PKNAME="/dev/sdb" TYPE="part" TRAN="" RM="1" SIZE="16007561216" MODEL="" SERIAL="" VENDOR="" RO="0" ROTA="0" PTTYPE="dos" WWN="" FSTYPE="vfat" LABEL="MIS\x20\x22FOTOS\x22" MOUNTPOINT="/run/media/u/MIS\x20FOTOS" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/sdc" PKNAME="" TYPE="disk" TRAN="usb" RM="0" SIZE="4000787030016" MODEL="Expansion HDD   " SERIAL="NA8XYZ12" VENDOR="Seagate " RO="0" ROTA="1" PTTYPE="gpt" WWN="" FSTYPE="" LABEL="" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="4096"
+NAME="/dev/sdc1" PKNAME="/dev/sdc" TYPE="part" TRAN="" RM="0" SIZE="4000785948160" MODEL="" SERIAL="" VENDOR="" RO="0" ROTA="1" PTTYPE="gpt" WWN="" FSTYPE="ntfs" LABEL="RESPALDO" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="4096"
+NAME="/dev/sdd" PKNAME="" TYPE="disk" TRAN="usb" RM="0" SIZE="1000204886016" MODEL="Tech" SERIAL="123467" VENDOR="JMicron" RO="0" ROTA="1" PTTYPE="gpt" WWN="" FSTYPE="" LABEL="" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="4096"
+NAME="/dev/sde" PKNAME="" TYPE="disk" TRAN="usb" RM="1" SIZE="32010928128" MODEL="Flash Disk" SERIAL="" VENDOR="Generic" RO="0" ROTA="0" PTTYPE="dos" WWN="" FSTYPE="" LABEL="" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/sdf" PKNAME="" TYPE="disk" TRAN="usb" RM="1" SIZE="64023257088" MODEL="Ultra" SERIAL="USB-PROGRAMA" VENDOR="SanDisk" RO="0" ROTA="0" PTTYPE="dos" WWN="" FSTYPE="" LABEL="" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/sdf1" PKNAME="/dev/sdf" TYPE="part" TRAN="" RM="1" SIZE="64022208512" MODEL="" SERIAL="" VENDOR="" RO="0" ROTA="0" PTTYPE="dos" WWN="" FSTYPE="exfat" LABEL="TRANSPORTE" MOUNTPOINT="/run/media/u/TRANSPORTE" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/sdg" PKNAME="" TYPE="disk" TRAN="usb" RM="1" SIZE="128035676160" MODEL="USB 3.0" SERIAL="USB-LUKS" VENDOR="Kingston" RO="0" ROTA="0" PTTYPE="gpt" WWN="" FSTYPE="" LABEL="" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/sdg1" PKNAME="/dev/sdg" TYPE="part" TRAN="" RM="1" SIZE="128034627584" MODEL="" SERIAL="" VENDOR="" RO="0" ROTA="0" PTTYPE="gpt" WWN="" FSTYPE="crypto_LUKS" LABEL="" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/mapper/cifrada" PKNAME="/dev/sdg1" TYPE="crypt" TRAN="" RM="0" SIZE="128018000000" MODEL="" SERIAL="" VENDOR="" RO="0" ROTA="0" PTTYPE="" WWN="" FSTYPE="ext4" LABEL="" MOUNTPOINT="/run/media/u/x" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/mmcblk0" PKNAME="" TYPE="disk" TRAN="" RM="0" SIZE="63864569856" MODEL="" SERIAL="0x1234abcd" VENDOR="" RO="0" ROTA="0" PTTYPE="dos" WWN="" FSTYPE="" LABEL="" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/sda" PKNAME="" TYPE="disk" TRAN="" RM="0" SIZE="500107862016" MODEL="Virtual Disk" SERIAL="VIRT1" VENDOR="" RO="0" ROTA="1" PTTYPE="gpt" WWN="" FSTYPE="" LABEL="" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/sdh" PKNAME="" TYPE="disk" TRAN="usb" RM="1" SIZE="7744782336" MODEL="Silicon" SERIAL="SUPER-1" VENDOR="" RO="0" ROTA="0" PTTYPE="" WWN="" FSTYPE="vfat" LABEL="CRUDA" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/loop0" PKNAME="" TYPE="loop" TRAN="" RM="0" SIZE="104857600" MODEL="" SERIAL="" VENDOR="" RO="1" ROTA="0" PTTYPE="" WWN="" FSTYPE="squashfs" LABEL="" MOUNTPOINT="/snap" LOG-SEC="512" PHY-SEC="512"
+NAME="/dev/sr0" PKNAME="" TYPE="rom" TRAN="sata" RM="1" SIZE="1073741312" MODEL="DVD" SERIAL="DVD1" VENDOR="" RO="0" ROTA="1" PTTYPE="" WWN="" FSTYPE="" LABEL="" MOUNTPOINT="" LOG-SEC="2048" PHY-SEC="2048"
+NAME="/dev/sdi" PKNAME="" TYPE="disk" TRAN="usb" RM="1" SIZE="0" MODEL="STORAGE DEVICE" SERIAL="" VENDOR="Generic" RO="0" ROTA="0" PTTYPE="" WWN="" FSTYPE="" LABEL="" MOUNTPOINT="" LOG-SEC="512" PHY-SEC="512"'
+
+ap_cargar() {          # ap_cargar [lineas de config...]
+    reiniciar_reglas
+    printf '%s\n' "$@" > "$CONF_FILE"
+    cargar_config
+    cargar_preferencias
+    limpiar_datos
+    procesar_lsblk <<< "$AP_FIXTURE"
+    # Lo que detectar_sistema sacaria de findmnt / swapon en un Omarchy real:
+    marcar_sistema "/dev/mapper/root"          "$(razon_de_montaje /)"
+    marcar_sistema "/dev/mapper/root[/@home]"  "$(razon_de_montaje /home)"
+    marcar_sistema "/dev/nvme0n1p1"            "$(razon_de_montaje /boot)"
+    marcar_sistema "/dev/sdf1"                 "EL PROGRAMA SE ESTA EJECUTANDO DESDE ESTE DISCO"
+}
+
+autoprueba() (
+    # Subshell: nada de lo que se simula aqui sale afuera.
+    local tmp f u1 u8 d
+    AP_OK=0; AP_FALLO=0
+    tmp=$(mktemp -d) || exit 1
+    trap 'rm -rf -- "$tmp"' EXIT
+    CONF_FILE="$tmp/config.conf"; PREF_FILE="$tmp/preferencias"; LOG_FILE="$tmp/registro.log"
+
+    printf '\n  %s/// AUTOPRUEBA DEL GUARDIAN ///%s   (discos simulados, no se toca nada)\n' "$C_ORO" "$C_RST"
+
+    ui_titulo "lectura de lsblk"
+    ap_cargar
+    comprobar "10 discos reales; se ignoran loop, DVD y el lector sin tarjeta" igual "${#DISCOS[@]}" 10
+    comprobar "etiqueta con espacio y comillas escapadas: MIS \"FOTOS\""       igual "${P_ETIQ[sdb1]}" 'MIS "FOTOS"'
+    comprobar "punto de montaje con espacio decodificado"                    igual "${P_MONT[sdb1]}" '/run/media/u/MIS FOTOS'
+    comprobar "modelo sin espacios de relleno"                               igual "${D_MODELO[sdc]}" 'Expansion HDD'
+    comprobar "memoria sin tabla de particiones: el disco hace de particion"  igual "$(recortar "${D_PARTES[sdh]}")" sdh
+    comprobar "la raiz cifrada (LUKS) se resuelve hasta el NVMe"              igual "$(discos_bajo mapper/root)" nvme0n1
+
+    ui_titulo "nivel 1 - nucleo"
+    comprobar "disco del sistema: raiz / a traves de LUKS + btrfs"           razon_incluye nvme0n1 "DISCO DEL SISTEMA OPERATIVO (/)"
+    comprobar "disco del sistema: tambien arranque (/boot)"                  razon_incluye nvme0n1 "DISCO DE ARRANQUE (/boot)"
+    comprobar "subvolumen btrfs [/@home] resuelto al mismo disco"            razon_incluye nvme0n1 "ALOJA /home"
+    comprobar "NVMe interno: solo diagnostico"                               razon_incluye nvme0n1 "SOLO DIAGNOSTICO"
+    comprobar "la memoria desde la que corre el programa queda intocable"    es_nucleo sdf
+    comprobar "memoria con volumen LUKS abierto encima: bloqueada"           razon_incluye sdg "ABIERTO ENCIMA"
+    comprobar "bus desconocido: se asume lo peor"                            razon_incluye sda "BUS DESCONOCIDO"
+    comprobar "tarjeta SD (mmcblk) sin transporte declarado: permitida"      operable mmcblk0
+    cambiar_proteccion SERIE-SISTEMA eximir; ap_cargar
+    comprobar "EXIMIR el disco del sistema no levanta el nucleo"             es_nucleo nvme0n1
+    comprobar "  ... y su estado sigue siendo 'nucleo'"                      igual "$(estado_proteccion nvme0n1)" nucleo
+    rm -f -- "$PREF_FILE"
+
+    ui_titulo "nivel 2 - heuristicas"
+    ap_cargar
+    comprobar "Seagate 4 TB: bloqueado por varias reglas a la vez"           al_menos sdc 2
+    comprobar "  ... incluye el modelo"                                      razon_incluye sdc "MODELO CONTIENE 'SEAGATE'"
+    comprobar "  ... e incluye el tamano"                                    razon_incluye sdc "EXCEDE EL LIMITE DE 2048 GB"
+    comprobar "memoria SanDisk de 16 GB: permitida"                          operable sdb
+    comprobar "HDD de 1 TB en carcasa JMicron (como el H:): permitido"       operable sdd
+    cambiar_proteccion NA8XYZ12 eximir; ap_cargar
+    comprobar "EXIMIR el Seagate lo libera (modelo y tamano)"                operable sdc
+    cambiar_proteccion NA8XYZ12 reactivar; ap_cargar
+    comprobar "REACTIVAR lo vuelve a bloquear"                               bloqueado sdc
+    cambiar_proteccion NA8 eximir; ap_cargar
+    comprobar "una exencion corta ('NA8') NO libera series que la contengan" bloqueado sdc
+    rm -f -- "$PREF_FILE"
+    ap_cargar "seriales = NA8XYZ12" "permitidos = NA8XYZ12"
+    comprobar "serie en lista negra Y en permitidos: gana la lista negra"    razon_incluye sdc "NUMERO DE SERIE BLINDADO"
+    ap_cargar "etiquetas = respaldo"
+    comprobar "etiqueta agregada en config.conf"                             razon_incluye sdc "ETIQUETA BLINDADA 'RESPALDO'"
+    ap_cargar "tam_max_gb = 900"
+    comprobar "tam_max_gb = 900 lo baja: el HDD de 1 TB queda bloqueado"     bloqueado sdd
+    ap_cargar "tam_max_gb = 4096"
+    comprobar "tam_max_gb = 4096 se ignora: solo se puede bajar"             igual "$G_TAM_MAX_GB" 2048
+    ap_cargar "tam_max_gb = 0900"
+    comprobar "tam_max_gb = 0900 se lee en decimal, no en octal"             igual "$G_TAM_MAX_GB" 900
+    ap_cargar "seriales = \$(touch $tmp/INYECTADO)" "modelos = \`touch $tmp/INYECTADO2\`"
+    comprobar "config.conf se lee, no se ejecuta: \$(...) no corre"          test ! -e "$tmp/INYECTADO" -a ! -e "$tmp/INYECTADO2"
+    printf 'esto no es una config\x00\xff\n= = =\nseriales\n' > "$CONF_FILE"
+    reiniciar_reglas; cargar_config; limpiar_datos; procesar_lsblk <<< "$AP_FIXTURE"
+    comprobar "config.conf corrupto: el programa sigue igual de protegido"   bloqueado sdc
+
+    ui_titulo "nivel 3 - lo que decides tu"
+    rm -f -- "$PREF_FILE"; ap_cargar
+    cambiar_proteccion USB-PRUEBA-1 proteger; ap_cargar
+    comprobar "memoria libre -> PROTEGER -> bloqueada"                       razon_incluye sdb "PROTEGIDO POR TI"
+    comprobar "la proteccion sobrevive a releer el archivo"                  grep -q $'^protegido\tUSB-PRUEBA-1$' "$PREF_FILE"
+    cambiar_proteccion USB-PRUEBA-1 desproteger; ap_cargar
+    comprobar "DESPROTEGER la devuelve a operable"                           operable sdb
+    cambiar_proteccion NA8XYZ12 eximir; cambiar_proteccion NA8XYZ12 proteger; ap_cargar
+    comprobar "PROTEGER gana sobre EXIMIR"                                   razon_incluye sdc "PROTEGIDO POR TI"
+    comprobar "disco sin serie: no se puede recordar"                        test "$(cambiar_proteccion '' proteger 2>/dev/null; echo $?)" = 1
+    comprobar "  ... y su tarjeta lo dice"                                   igual "$(estado_proteccion sde)" sinserie
+    printf 'basura\x00\nprotegido\n\texento\n' > "$PREF_FILE"; ap_cargar
+    comprobar "preferencias corruptas: nada se libera"                       bloqueado sdc
+
+    ui_titulo "identidad y rutas"
+    rm -f -- "$PREF_FILE"; ap_cargar
+    comprobar "disco que desaparece entre la tarjeta y la escritura: aborta" \
+        eval '! verificar_antes_de_escribir sdz "x|1|y|z"'
+    comprobar "huella: serie + tamano + modelo + WWN"                        igual "$(huella_guardada sdd)" "123467|1000204886016|Tech|"
+    fuente_de_montaje() { echo /dev/sdb1; }
+    comprobar "LIMPIAR se niega con una ruta vacia"                          eval '! ruta_limpiable sdb1 ""'
+    comprobar "LIMPIAR se niega con la raiz /"                               eval '! ruta_limpiable sdb1 /'
+    comprobar "LIMPIAR se niega si el montaje es de otra particion"          eval '! ruta_limpiable sdc1 "$tmp"'
+    comprobar "particiones: sdb->sdb1, mmcblk0->mmcblk0p1, nvme0n1->nvme0n1p1" \
+        test "$(nombre_particion sdb 1) $(nombre_particion mmcblk0 1) $(nombre_particion nvme0n1 1)" = "/dev/sdb1 /dev/mmcblk0p1 /dev/nvme0n1p1"
+
+    ui_titulo "formatos, imagenes y diagnostico"
+    comprobar "16 GB -> FAT32, 64 GB -> exFAT"                               test "$(fs_automatico 16008609792) $(fs_automatico 64023257088)" = "vfat exfat"
+    comprobar "etiqueta FAT32: mayusculas, sin simbolos, 11 caracteres"      igual "$(etiqueta_valida vfat 'mis fotos 2024!')" "MIS FOTOS 2"
+    comprobar "etiqueta vacia -> USB"                                        igual "$(etiqueta_valida exfat '')" USB
+    comprobar "hash: 32 MD5, 40 SHA1, 64 SHA256, otro nada" \
+        test "$(algoritmo_hash "$(printf '%032d' 0)") $(algoritmo_hash "$(printf '%040d' 0)") $(algoritmo_hash "$(printf '%064d' 0)") $(algoritmo_hash abc || echo no)" = "md5sum sha1sum sha256sum no"
+    f="$tmp/linux.img"; { head -c 510 /dev/zero; printf '\x55\xaa'; } > "$f"
+    comprobar "imagen con firma 0x55AA: arrancable"                          igual "$(firma_arranque "$f")" 55aa
+    f="$tmp/windows.iso"; head -c 512 /dev/zero > "$f"
+    comprobar "imagen sin firma (ISO de Windows): se detecta para avisar"    test "$(firma_arranque "$f")" != 55aa
+    comprobar "acceso 0.3 ms -> electronico"                                 contiene "$(veredicto_acceso 0.3)" ELECTRONICO
+    comprobar "acceso 5 ms -> no concluyente"                                contiene "$(veredicto_acceso 5)" "NO CONCLUYENTE"
+    comprobar "acceso 12 ms -> mecanico"                                     contiene "$(veredicto_acceso 12)" MECANICO
+    u1=$(umbrales 1048576); u8=$(umbrales 8388608)
+    for d in 23 120 2000; do
+        comprobar "disco a $d MB/s: misma franja con bloque de 1 MB y de 8 MB" \
+            test "$(franja "$(LC_ALL=C awk -v v="$d" 'BEGIN{print 1000/v}')" "$u1")" = \
+                 "$(franja "$(LC_ALL=C awk -v v="$d" 'BEGIN{print 8000/v}')" "$u8")"
+    done
+
+    ui_titulo "estructura del programa"
+    for f in op_limpiar op_formatear op_reparar op_grabar; do
+        comprobar "$f vuelve a pasar el guardian justo antes de escribir" \
+            eval "declare -f $f | grep -q verificar_antes_de_escribir"
+    done
+    comprobar "las ordenes destructivas solo viven en funciones permitidas" ap_destructivas_contenidas
+
+    printf '\n  %s%d comprobaciones, %d fallos%s\n' \
+        "$([[ $AP_FALLO -eq 0 ]] && printf '%s' "$C_VERDE" || printf '%s' "$C_ROJO")" \
+        "$((AP_OK + AP_FALLO))" "$AP_FALLO" "$C_RST"
+    (( AP_FALLO == 0 ))
+)
+
+# Ninguna funcion fuera de esta lista puede contener wipefs, sfdisk,
+# mkfs, rm -rf o un dd que escriba en /dev: si alguien agrega una, la
+# autoprueba lo delata.
+ap_destructivas_contenidas() {
+    local fn permitidas=" op_limpiar op_reparar op_grabar crear_fs op_formatear op_expulsar "
+    for fn in $(declare -F | awk '{print $3}'); do
+        [[ $fn == ap_* || $fn == autoprueba ]] && continue
+        if declare -f "$fn" | grep -qE 'wipefs -a|sfdisk --|mkfs\.[a-z0-9]+ -|rm -rf|dd (if=[^ ]+ )?of="/dev/|/device/delete'; then
+            [[ $permitidas == *" $fn "* ]] || { echo "destructiva fuera de lugar: $fn"; return 1; }
+        fi
+    done
+}
+
+main "$@"

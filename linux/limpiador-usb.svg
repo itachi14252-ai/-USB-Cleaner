@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- El mismo lenguaje que limpiador.ico: cuadro negro con las esquinas
+       cortadas, marco y corchetes dorados, y las tres barras rojas /// -->
+  <polygon points="36,8 220,8 248,36 248,220 220,248 36,248 8,220 8,36"
+           fill="#0a0a0a" stroke="#c9a227" stroke-width="6"/>
+  <g fill="none" stroke="#c9a227" stroke-width="8" stroke-linecap="square">
+    <path d="M44 84 V44 H84"/>
+    <path d="M172 44 H212 V84"/>
+    <path d="M212 172 V212 H172"/>
+    <path d="M84 212 H44 V172"/>
+  </g>
+  <g fill="#e0102a">
+    <polygon points="58,186 82,186 114,70 90,70"/>
+    <polygon points="100,186 124,186 156,70 132,70"/>
+    <polygon points="142,186 166,186 198,70 174,70"/>
+  </g>
+</svg>

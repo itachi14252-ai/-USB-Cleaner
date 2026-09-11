@@ -649,6 +649,9 @@ confía en un número que cambia al reconectar; el programa no.
 
 No hace falta compilar nada. Windows 10 y 11 ya traen todo lo que usa.
 
+¿La otra computadora es Linux (Omarchy, Arch…)? Esta versión no corre ahí:
+lleva la carpeta [`linux/`](linux/README.md) y ejecuta su `instalar.sh`.
+
 1. Copia **la carpeta entera** a la otra máquina (por USB, red, donde sea).
 2. Ahí, doble clic en **`Crear acceso directo.cmd`**.
 3. Aparece *Limpiador de USB* en el Escritorio, con icono y marcado para
@@ -691,6 +694,7 @@ día decides empaquetarlo.
 | `preferencias.json` | Lo que marcaste con PROTEGER / EXIMIR. Lo crea el programa. |
 | `limpiador.ico` | Icono de las ventanas y del acceso directo: negro, marco dorado y las barras `///`. |
 | `Crear icono.ps1` | Regenera `limpiador.ico`. Solo si quieres retocar el diseño. |
+| `linux/` | Versión para Linux / Omarchy, con el mismo guardián. Programa aparte: ver [su README](linux/README.md). |
 
 ---
 

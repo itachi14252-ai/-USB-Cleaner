@@ -8,6 +8,12 @@
 *.json  text eol=crlf
 *.md    text eol=crlf
 
+# La version Linux / Omarchy es lo contrario: bash falla con CRLF
+# ("$'\r': command not found"). Va despues de las reglas de arriba para
+# ganarles, incluido su README.md.
+linux/**        text eol=lf
+linux/*.svg     text eol=lf
+
 # Binarios: que git no los toque nunca
 *.ico   binary
 *.png   binary
